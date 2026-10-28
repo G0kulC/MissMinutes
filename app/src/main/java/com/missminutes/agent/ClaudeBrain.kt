@@ -3,12 +3,16 @@ package com.missminutes.agent
 import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.awaitCancellation
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.ResponseBody
 import org.json.JSONArray
 import org.json.JSONObject
 import java.io.IOException
@@ -44,8 +48,12 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
     private var fallbackModel: String? = null
     private var fallbackUntil = 0L
 
-    /** [context]: something she just said that Claude didn't produce (a reminder or alert being answered). */
-    suspend fun handle(spoken: String, context: String? = null): String {
+    /**
+     * [context]: something she just said that Claude didn't produce (a reminder or alert being answered).
+     * [onSentence] receives each sentence to say as soon as Claude has written it (called on a background
+     * thread). Everything she should say comes through it, so the caller doesn't speak the returned text again.
+     */
+    suspend fun handle(spoken: String, context: String? = null, onSentence: (String) -> Unit = {}): String {
         val userText = if (context == null) spoken else "(Miss Minutes just told me: \"$context\") $spoken"
         val now = System.currentTimeMillis()
         if (now - lastTurn > 3 * 60_000) history.clear() // fresh conversation after 3 quiet minutes
@@ -58,11 +66,22 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         // the system prompt, stays byte-for-byte the same. Rebuilding it each round (the clock ticking over,
         // a new memory) made the API reject the turn with "Invalid signature in thinking block".
         val system = systemPrompt()
+        val model = pickModel(spoken)
+        Log.i("MissMinutes", "Model for this turn: $model")
 
-        var reply = ""
+        val said = StringBuilder()
+        val splitter = SentenceSplitter { sentence ->
+            val clean = speakable(sentence)
+            if (clean.isNotEmpty()) {
+                said.append(clean).append(' ')
+                onSentence(clean)
+            }
+        }
+
         var acted = false
         for (round in 0 until MAX_ROUNDS) {
-            val resp = callWithFallback(messages, system)
+            val resp = callWithFallback(model, messages, system) { splitter.add(it) }
+            splitter.flush() // say anything left before tools run or the turn ends
             val content = resp.getJSONArray("content")
             val stopReason = resp.optString("stop_reason")
             messages.put(JSONObject().put("role", "assistant").put("content", content))
@@ -106,7 +125,6 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                     }
                 }
             }
-            if (texts.isNotBlank()) reply = texts.toString()
             Log.i("MissMinutes", "Claude round $round: stop=$stopReason blocks=" +
                 (0 until content.length()).joinToString(",") { content.getJSONObject(it).optString("type") })
 
@@ -117,7 +135,11 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             }
         }
 
-        reply = speakable(reply).ifBlank { if (acted) "Done!" else "Sorry, I couldn't work that out. Try asking another way?" }
+        var reply = said.toString().trim()
+        if (reply.isEmpty()) {
+            reply = if (acted) "Done!" else "Sorry, I couldn't work that out. Try asking another way?"
+            onSentence(reply)
+        }
         history.add(textMessage("user", userText))
         history.add(textMessage("assistant", reply))
         while (history.size > 12) { history.removeAt(0); history.removeAt(0) }
@@ -126,46 +148,67 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
 
     // ---------- API calls ----------
 
-    private suspend fun callWithFallback(messages: JSONArray, system: JSONArray): JSONObject {
-        var model = if (System.currentTimeMillis() < fallbackUntil) fallbackModel ?: prefs.model else prefs.model
+    /** Haiku for simple commands when Quick replies is on; otherwise the model chosen in the app. */
+    private fun pickModel(spoken: String): String {
+        val main = if (System.currentTimeMillis() < fallbackUntil) fallbackModel ?: prefs.model else prefs.model
+        return if (prefs.quickReplies && QuickRouter.isQuick(spoken)) BrainModel.FAST.id else main
+    }
+
+    private suspend fun callWithFallback(
+        startModel: String, messages: JSONArray, system: JSONArray, onText: (String) -> Unit
+    ): JSONObject {
+        var model = startModel
+        val tried = mutableSetOf(model)
         while (true) {
+            var spoke = false
             try {
-                return callWithRetry(model, messages, system)
+                return callWithRetry(model, messages, system) { spoke = true; onText(it) }
             } catch (e: ClaudeException) {
                 if (e.code == 400 && e.message.orEmpty().contains("signature") && stripThinking(messages)) {
                     Log.w("MissMinutes", "Thinking blocks rejected; retrying without them", e)
                     continue
                 }
-                val next = BrainModel.fallbackAfter(model)
+                // Once she has started saying the answer, switching model would make her repeat herself.
+                if (spoke) throw e
+                val next = (BrainModel.fallbackAfter(model) ?: BrainModel.byId(prefs.model))?.takeIf { it.id !in tried }
                 val modelProblem = e.code == 404 || e.code == 529 ||
                     (e.code == 400 && e.message.orEmpty().contains("model", ignoreCase = true))
                 if (!modelProblem || next == null) throw e
+                if (model == prefs.model) {
+                    fallbackModel = next.id
+                    fallbackUntil = System.currentTimeMillis() + 10 * 60_000
+                }
                 model = next.id
-                fallbackModel = model
-                fallbackUntil = System.currentTimeMillis() + 10 * 60_000
+                tried += model
                 listener?.onModelSwitched(next)
             }
         }
     }
 
-    private suspend fun callWithRetry(model: String, messages: JSONArray, system: JSONArray): JSONObject {
+    private suspend fun callWithRetry(
+        model: String, messages: JSONArray, system: JSONArray, onText: (String) -> Unit
+    ): JSONObject {
         var attempt = 0
         while (true) {
+            var spoke = false
             try {
-                return post(model, messages, system)
+                return post(model, messages, system) { spoke = true; onText(it) }
             } catch (e: ClaudeException) {
-                if (e.code !in RETRYABLE || attempt >= 2) throw e
+                if (spoke || e.code !in RETRYABLE || attempt >= 2) throw e
             } catch (e: CancellationException) {
                 throw e
             } catch (e: IOException) {
-                if (attempt >= 1) throw e
+                if (spoke || attempt >= 1) throw e
             }
             attempt++
             delay(700L * attempt)
         }
     }
 
-    private suspend fun post(model: String, messages: JSONArray, system: JSONArray): JSONObject = withContext(Dispatchers.IO) {
+    /** Streams the reply: [onText] gets text the moment it arrives, and the full response is rebuilt for the next round. */
+    private suspend fun post(
+        model: String, messages: JSONArray, system: JSONArray, onText: (String) -> Unit
+    ): JSONObject = coroutineScope {
         val key = prefs.claudeKey
         if (key.isBlank()) throw ClaudeException(401, "missing_key", "Add your Claude API key in the Miss Minutes app")
 
@@ -174,6 +217,7 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         val body = JSONObject()
             .put("model", model)
             .put("max_tokens", 4096) // room to think and read search results; 1024 cut answers off
+            .put("stream", true)
             .put("system", system)
             .put("tools", tools)
             .put("messages", messages)
@@ -185,18 +229,93 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             .post(body.toString().toRequestBody("application/json".toMediaType()))
             .build()
 
-        http.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) {
-                val err = runCatching { JSONObject(text).getJSONObject("error") }.getOrNull()
-                throw ClaudeException(
-                    resp.code,
-                    err?.optString("type").orEmpty(),
-                    err?.optString("message")?.takeIf { it.isNotBlank() } ?: "Claude ${resp.code}: ${text.take(160)}"
-                )
+        val call = http.newCall(req)
+        // Reading the stream blocks a thread; if the conversation is cancelled (you swiped her away), close it.
+        val watcher = launch { try { awaitCancellation() } finally { call.cancel() } }
+        try {
+            withContext(Dispatchers.IO) {
+                call.execute().use { resp ->
+                    if (!resp.isSuccessful) {
+                        val text = resp.body?.string().orEmpty()
+                        val err = runCatching { JSONObject(text).getJSONObject("error") }.getOrNull()
+                        throw ClaudeException(
+                            resp.code,
+                            err?.optString("type").orEmpty(),
+                            err?.optString("message")?.takeIf { it.isNotBlank() } ?: "Claude ${resp.code}: ${text.take(160)}"
+                        )
+                    }
+                    readStream(resp.body ?: throw IOException("Claude sent an empty reply"), onText)
+                }
             }
-            JSONObject(text)
+        } finally {
+            watcher.cancel()
         }
+    }
+
+    /** Rebuilds the message from Claude's stream events, exactly as a non-streamed reply would look. */
+    private fun readStream(body: ResponseBody, onText: (String) -> Unit): JSONObject {
+        val blocks = sortedMapOf<Int, JSONObject>()
+        val partialInput = HashMap<Int, StringBuilder>()
+        var stopReason = ""
+        var finished = false
+        body.byteStream().bufferedReader(Charsets.UTF_8).use { reader ->
+            while (!finished) {
+                val line = reader.readLine() ?: break
+                if (!line.startsWith("data:")) continue
+                val event = runCatching { JSONObject(line.substring(5).trim()) }.getOrNull() ?: continue
+                when (event.optString("type")) {
+                    "content_block_start" -> {
+                        val index = event.getInt("index")
+                        val block = JSONObject(event.getJSONObject("content_block").toString())
+                        blocks[index] = block
+                        val type = block.optString("type")
+                        if (type == "tool_use" || type == "server_tool_use") partialInput[index] = StringBuilder()
+                    }
+                    "content_block_delta" -> {
+                        val index = event.getInt("index")
+                        val block = blocks[index] ?: continue
+                        val delta = event.getJSONObject("delta")
+                        when (delta.optString("type")) {
+                            "text_delta" -> {
+                                val piece = delta.optString("text")
+                                block.put("text", block.optString("text") + piece)
+                                onText(piece)
+                            }
+                            "input_json_delta" -> partialInput[index]?.append(delta.optString("partial_json"))
+                            "thinking_delta" -> block.put("thinking", block.optString("thinking") + delta.optString("thinking"))
+                            "signature_delta" -> block.put("signature", delta.optString("signature"))
+                            "citations_delta" -> {
+                                val list = block.optJSONArray("citations") ?: JSONArray().also { block.put("citations", it) }
+                                delta.optJSONObject("citation")?.let { list.put(it) }
+                            }
+                        }
+                    }
+                    "content_block_stop" -> {
+                        val index = event.getInt("index")
+                        partialInput.remove(index)?.let { raw ->
+                            blocks[index]?.put("input", if (raw.isBlank()) JSONObject() else JSONObject(raw.toString()))
+                        }
+                    }
+                    "message_delta" -> event.optJSONObject("delta")?.optString("stop_reason")
+                        ?.takeIf { it.isNotEmpty() && it != "null" }?.let { stopReason = it }
+                    "message_stop" -> finished = true
+                    "error" -> {
+                        val err = event.optJSONObject("error")
+                        val type = err?.optString("type").orEmpty()
+                        val code = when (type) {
+                            "overloaded_error" -> 529
+                            "rate_limit_error" -> 429
+                            else -> 500
+                        }
+                        throw ClaudeException(code, type, err?.optString("message") ?: "Claude stream error")
+                    }
+                }
+            }
+        }
+        if (!finished) throw IOException("The connection to Claude dropped mid-reply")
+        val content = JSONArray()
+        blocks.values.forEach { content.put(it) }
+        return JSONObject().put("content", content).put("stop_reason", stopReason)
     }
 
     /**

@@ -31,6 +31,7 @@ import kotlinx.coroutines.cancel
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
 import java.net.SocketTimeoutException
@@ -55,6 +56,7 @@ class MissMinutesService : Service() {
         private const val CHANNEL = "miss_minutes"
         private const val NOTIF_ID = 7
         private const val TAG = "MissMinutes"
+        private const val FILLER_AFTER_MS = 1100L
         private const val MAX_ROUNDS = 6
         private val CONFIRM_PHRASES = listOf(
             "shall i", "should i", "can i", "do you want me to", "want me to", "is that ok", "is that okay",
@@ -285,22 +287,16 @@ class MissMinutesService : Service() {
                 overlay.hidePanel()
                 overlay.setState(OrbState.THINKING)
                 actions.quietAfterAction = false
-                val reply = brain.handle(heard, context)
+                val turn = replyAndSpeak(heard, context)
                 context = null
                 if (actions.quietAfterAction) {
                     overlay.setState(OrbState.SPEAKING)
                     delay(900)
                     break
                 }
+                val reply = turn.reply
+                val cutIn = turn.cutIn
                 val asked = reply.trimEnd().endsWith("?")
-                val cutIn = speak(reply) {
-                    overlay.setState(OrbState.SPEAKING)
-                    if (asked) {
-                        val kind = if (isConfirmation(reply)) OverlayManager.PanelKind.CONFIRM
-                                   else OverlayManager.PanelKind.QUESTION
-                        overlay.showPanel(reply, kind)
-                    }
-                }
 
                 rounds++
                 if (rounds >= MAX_ROUNDS) break
@@ -339,10 +335,62 @@ class MissMinutesService : Service() {
         }
     }
 
-    /** Downloads every greeting for the current name and voice, so waking her never waits on the network. */
+    /**
+     * Downloads every greeting and filler for the current name and voice, so they never wait on the network.
+     * (The cache keeps only what's listed here, so both lists go together.)
+     */
     private fun prefetchGreetings() {
-        if (!prefs.greetOnWake || prefs.sarvamKey.isBlank()) return
-        scope.launch { player.prefetch(Greetings.all(prefs)) }
+        if (prefs.sarvamKey.isBlank()) return
+        val lines = (if (prefs.greetOnWake) Greetings.all(prefs) else emptyList()) + Fillers.all()
+        scope.launch { player.prefetch(lines) }
+    }
+
+    private class Turn(val reply: String, val cutIn: ByteArray?)
+
+    /**
+     * Asks Claude and speaks each sentence the moment it's written, instead of waiting for the whole answer.
+     * If Claude is slow to start, a short cached filler ("ஒரு நிமிஷம்…") covers the silence.
+     * If you talk over her, the rest of the answer is dropped (actions still finish).
+     */
+    private suspend fun replyAndSpeak(heard: String, context: String?): Turn = coroutineScope {
+        val lines = Channel<Pair<String, Boolean>>(Channel.UNLIMITED) // text, from cache
+        val order = Any()
+        var started = false
+        var cutIn: ByteArray? = null
+
+        val speaker = launch {
+            for ((line, cached) in lines) {
+                if (cutIn != null || actions.quietAfterAction) continue
+                val asked = line.trimEnd().endsWith("?")
+                val heardOver = speak(line, cache = cached) {
+                    overlay.setState(OrbState.SPEAKING)
+                    if (asked) {
+                        val kind = if (isConfirmation(line)) OverlayManager.PanelKind.CONFIRM
+                                   else OverlayManager.PanelKind.QUESTION
+                        overlay.showPanel(line, kind)
+                    }
+                }
+                if (heardOver != null) cutIn = heardOver
+            }
+        }
+        val filler = launch {
+            delay(FILLER_AFTER_MS)
+            val line = Fillers.pick(heard)
+            if (!player.isCached(line)) return@launch
+            synchronized(order) { if (!started) { started = true; lines.trySend(line to true) } }
+        }
+
+        val reply = try {
+            brain.handle(heard, context) { sentence ->
+                synchronized(order) { started = true; lines.trySend(sentence to false) }
+            }
+        } finally {
+            filler.cancel()
+            lines.close()
+        }
+        speaker.join()
+        if (actions.quietAfterAction) player.stop()
+        Turn(reply, cutIn)
     }
 
     private fun takeAnswer(): String? = pendingAnswer?.also { pendingAnswer = null }

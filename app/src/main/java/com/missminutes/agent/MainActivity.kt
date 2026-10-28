@@ -478,7 +478,7 @@ class MainActivity : Activity() {
 
     private fun buildBrain() {
         val card = card()
-        header(card, "Brain", "The Claude model that thinks and acts for her. If one isn't available, she moves to the next.")
+        header(card, "Brain", "The Claude model that thinks and acts for her. With Quick replies on, simple commands use Haiku. If a model isn't available, she moves to the next.")
         modelBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(modelBox, full(top = 8))
         refreshModels()
@@ -563,6 +563,8 @@ class MainActivity : Activity() {
         header(card, "Behaviour", null)
         card.addView(toggle("Ask before sending", "She reads a message or call back and waits for your yes.",
             prefs.confirmBeforeSending) { prefs.confirmBeforeSending = it })
+        card.addView(toggle("Quick replies", "Simple commands like calls, alarms or the flashlight use Claude Haiku 5.5 for an instant answer.",
+            prefs.quickReplies) { prefs.quickReplies = it })
         card.addView(toggle("Search the web", "Live answers: weather, news, scores, prices.",
             prefs.webSearch) { prefs.webSearch = it })
         card.addView(toggle("Keep listening", "Carry on talking after each reply without the wake word.",

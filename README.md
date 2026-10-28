@@ -3,6 +3,11 @@
 Your personal Android voice agent. Say the wake word, an animated minute-dial orb appears at the bottom of
 the screen, you speak Tamil, English or Tanglish, and she does it on your phone and answers out loud.
 
+## Speed update
+- **Streaming replies:** she starts speaking after Claude's first sentence instead of waiting for the whole answer.
+- **Quick replies:** simple commands go to Claude Haiku 5.5 automatically (toggle in Behaviour). Fable removed.
+- **Fillers:** if Claude is slow to start, she says a short cached "ஒரு நிமிஷம்…" or "One sec…".
+
 ## What's new in 2.1
 - **Your own wake word:** type any English phrase in the app ("Hey Jarvis", "Ok Buddy") and tap Save.
   No training: the offline Vosk model already knows the words, and the app checks each one.
@@ -21,7 +26,7 @@ the screen, you speak Tamil, English or Tanglish, and she does it on your phone 
   welcome board, setup checklist and card-based settings in the Outfit font; new app and notification icons.
 
 ## What's new in 2.0
-- **Best model by default:** Claude Fable 5.1. Pick Opus 5.5, Sonnet 5.5 or Haiku 5.5 in the app.
+- **Models:** Claude Sonnet 5.5 by default. Pick Opus 5.5, Sonnet 5.5 or Haiku 5.5 in the app.
   If a model isn't available or is overloaded, she automatically moves to the next one.
 - **Uses any app:** she can read the screen, tap, type, scroll and chain steps
   ("open Swiggy and search biryani", "turn on Wi-Fi hotspot in Settings").
@@ -57,8 +62,8 @@ the screen, you speak Tamil, English or Tanglish, and she does it on your phone 
      Allow restricted settings, then try again.
 
 ## Cost and speed
-Fable 5.1 gives the best results but is the slowest and most expensive. For quick everyday commands,
-Sonnet 5.5 or Haiku 5.5 reply faster and cost much less. Switch any time in the app.
+Sonnet 5.5 is the everyday default. Opus 5.5 is smartest for long tasks inside apps but slower.
+With **Quick replies** on, simple commands (calls, alarms, flashlight, music) automatically use Haiku 5.5.
 
 ## Add a new power
 1. Add a tool to `TOOLS_JSON` in `ClaudeBrain.kt` (name, description, inputs).

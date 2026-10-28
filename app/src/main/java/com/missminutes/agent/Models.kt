@@ -1,10 +1,9 @@
 package com.missminutes.agent
 
-/** Claude models, best first. If one is unavailable, Miss Minutes falls back to the next. */
+/** Claude models, smartest first. If one is unavailable, Miss Minutes falls back to the next. */
 enum class BrainModel(val id: String, val title: String, val blurb: String) {
-    BEST("claude-fable-5-1", "Claude Fable 5.1", "The most capable. Best for long multi-step tasks. Slower replies, highest cost."),
-    SMART("claude-opus-5-5", "Claude Opus 5.5", "Very smart and reliable at controlling apps."),
-    BALANCED("claude-sonnet-5-5", "Claude Sonnet 5.5", "Fast and capable. A good everyday choice."),
+    SMART("claude-opus-5-5", "Claude Opus 5.5", "The smartest. Best for long multi-step tasks in your apps. Slower, costs more."),
+    BALANCED("claude-sonnet-5-5", "Claude Sonnet 5.5", "Fast and very capable. The best everyday choice."),
     FAST("claude-haiku-5-5", "Claude Haiku 5.5", "Quickest replies and lowest cost.");
 
     companion object {

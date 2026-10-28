@@ -104,6 +104,9 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
         else { Log.w("MissMinutes", "Discarded a ${tmp.length()}-byte voice clip"); tmp.delete() }
     }
 
+    /** True if [text] is already on the phone in the current voice, so it plays instantly. */
+    fun isCached(text: String) = cacheFile(text).exists()
+
     /** One file per phrase and voice: changing her voice in the app means fresh audio. */
     private fun cacheFile(text: String): File {
         val dir = File(appContext.cacheDir, "voice").apply { mkdirs() }

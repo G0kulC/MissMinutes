@@ -27,7 +27,12 @@ class Prefs(context: Context) {
     var claudeKey: String get() = secret("claude_key"); set(v) = putSecret("claude_key", v)
     var sarvamKey: String get() = secret("sarvam_key"); set(v) = putSecret("sarvam_key", v)
 
-    var model: String get() = str("model", BrainModel.BEST.id); set(v) = putStr("model", v)
+    /** A model that's no longer offered (Fable) falls back to Sonnet. */
+    var model: String
+        get() = str("model", BrainModel.BALANCED.id).takeIf { BrainModel.byId(it) != null } ?: BrainModel.BALANCED.id
+        set(v) = putStr("model", v)
+    /** Simple commands (flashlight, calls, alarms) go to Haiku for instant replies. */
+    var quickReplies: Boolean get() = bool("quick_replies", true); set(v) = putBool("quick_replies", v)
     // Falls back to the default if a saved voice was retired by Sarvam (bulbul:v2 voices don't work on v3).
     var sarvamSpeaker: String
         get() = str("sarvam_speaker", Voices.default).takeIf { it in Voices.sarvam } ?: Voices.default

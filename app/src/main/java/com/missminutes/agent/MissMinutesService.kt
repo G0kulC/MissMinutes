@@ -140,9 +140,10 @@ class MissMinutesService : Service() {
             ACTION_RELOAD -> {
                 stopWakeWord()
                 if (foreground) getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
+                prefetchGreetings()
                 if (foreground && session?.isActive != true) startWakeWord()
             }
-            else -> if (ensureForeground()) startWakeWord()
+            else -> if (ensureForeground()) { startWakeWord(); prefetchGreetings() }
         }
         return START_STICKY
     }
@@ -262,6 +263,9 @@ class MissMinutesService : Service() {
             if (intro != null) {
                 alreadySaid = speak(intro) { overlay.setState(OrbState.SPEAKING) }
                 waitMs = 5000L
+            } else if (typed == null && prefs.greetOnWake) {
+                // "சொல்லுங்க Arun!" — from a cached recording, so it's instant. Talking over it is fine.
+                alreadySaid = speak(Greetings.next(prefs), cache = true) { overlay.setState(OrbState.SPEAKING) }
             }
             while (true) {
                 overlay.setState(OrbState.LISTENING)
@@ -335,17 +339,23 @@ class MissMinutesService : Service() {
         }
     }
 
+    /** Downloads every greeting for the current name and voice, so waking her never waits on the network. */
+    private fun prefetchGreetings() {
+        if (!prefs.greetOnWake || prefs.sarvamKey.isBlank()) return
+        scope.launch { player.prefetch(Greetings.all(prefs)) }
+    }
+
     private fun takeAnswer(): String? = pendingAnswer?.also { pendingAnswer = null }
 
     /**
      * Speaks [text]. With barge-in on, the mic listens while she talks: if you start speaking she stops
      * straight away, and the audio of your first words is returned so the next recording can carry on from it.
      */
-    private suspend fun speak(text: String, onStart: () -> Unit): ByteArray? = coroutineScope {
+    private suspend fun speak(text: String, cache: Boolean = false, onStart: () -> Unit): ByteArray? = coroutineScope {
         val bargeIn = if (prefs.bargeIn) BargeIn() else null
         var listening: Deferred<ByteArray?>? = null
         try {
-            player.speak(text) {
+            player.speak(text, cache = cache) {
                 onStart()
                 if (bargeIn != null) listening = this@coroutineScope.async(Dispatchers.IO) {
                     bargeIn.listen { player.stop(); haptic() }

@@ -67,6 +67,7 @@ class MainActivity : Activity() {
     private lateinit var startButton: TextView
     private lateinit var setupCard: LinearLayout
     private lateinit var setupBox: LinearLayout
+    private lateinit var nameField: EditText
     private lateinit var wakeField: EditText
     private lateinit var wakeMessage: TextView
     private lateinit var modelBox: LinearLayout
@@ -103,6 +104,7 @@ class MainActivity : Activity() {
         }
         buildHero()
         buildSetup()
+        buildYou()
         buildWakeWord()
         buildBrain()
         buildVoice()
@@ -132,6 +134,11 @@ class MainActivity : Activity() {
         refreshPermissions()
         refreshReminders()
         refreshMemory()
+    }
+
+    override fun onPause() {
+        super.onPause()
+        if (welcome == null) saveName(nameField.text.toString()) // typed but never pressed Done
     }
 
     override fun onRequestPermissionsResult(requestCode: Int, permissions: Array<out String>, grantResults: IntArray) {
@@ -205,7 +212,13 @@ class MainActivity : Activity() {
         }
         board.addView(features, full(top = 26))
         board.addView(View(this), LinearLayout.LayoutParams(1, 0, 1f))
-        board.addView(button("Get started", ButtonStyle.FILLED) { dismissWelcome() }, full(top = 28))
+        board.addView(label("What should I call you?"), full(top = 28))
+        val welcomeName = input(prefs.userName, "Your name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS)
+        board.addView(welcomeName, full(top = 8))
+        board.addView(button("Get started", ButtonStyle.FILLED) {
+            saveName(welcomeName.text.toString())
+            dismissWelcome()
+        }, full(top = 16))
         board.addView(text("Setup takes about two minutes.", 13f, Fonts.REGULAR, Palette.MUTED).apply {
             gravity = Gravity.CENTER
         }, full(top = 12))
@@ -337,6 +350,46 @@ class MainActivity : Activity() {
         }, LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dpi(6)).apply { topMargin = dpi(8) })
     }
 
+    // ---------- You ----------
+
+    private fun buildYou() {
+        val card = card()
+        header(card, "You", "She uses your name when she greets you and now and then while you talk.")
+        card.addView(label("Your name"), full(top = 14))
+        nameField = input(prefs.userName, "Your name", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS).apply {
+            imeOptions = EditorInfo.IME_ACTION_DONE
+            setOnEditorActionListener { _, action, _ ->
+                if (action == EditorInfo.IME_ACTION_DONE || action == EditorInfo.IME_NULL) { saveName(text.toString()); clearFocus() }
+                false
+            }
+            onFocusChangeListener.let { previous ->
+                setOnFocusChangeListener { v, focused ->
+                    previous?.onFocusChange(v, focused)
+                    if (!focused) saveName(text.toString())
+                }
+            }
+        }
+        card.addView(nameField, full(top = 6))
+        card.addView(toggle("Greet me when she wakes",
+            "A quick hello like “Hey ${prefs.userName.ifBlank { "Gokul" }}!” or “சொல்லுங்க ${prefs.userName.ifBlank { "Gokul" }}!”, then she listens.",
+            prefs.greetOnWake) { prefs.greetOnWake = it; reloadService() }, full(top = 6))
+        card.addView(button("Hear greeting", ButtonStyle.OUTLINE) { hearGreeting() },
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dpi(48)).apply { topMargin = dpi(6) })
+    }
+
+    private fun saveName(raw: String) {
+        val name = raw.trim().replace(Regex("\\s+"), " ").take(30)
+        if (name == prefs.userName) return
+        prefs.userName = name
+        if (::nameField.isInitialized && nameField.text.toString() != name) nameField.setText(name)
+        reloadService() // fresh greetings with the new name
+    }
+
+    private fun hearGreeting() {
+        saveName(nameField.text.toString())
+        playSample(Greetings.all(prefs).drop(1).random(), cache = true)
+    }
+
     // ---------- Wake word ----------
 
     private fun buildWakeWord() {
@@ -346,7 +399,7 @@ class MainActivity : Activity() {
             InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_FLAG_CAP_WORDS).apply {
             imeOptions = EditorInfo.IME_ACTION_DONE
             setOnEditorActionListener { _, action, _ ->
-                if (action == EditorInfo.IME_ACTION_DONE) { saveWakePhrase(); true } else false
+                if (action == EditorInfo.IME_ACTION_DONE || action == EditorInfo.IME_NULL) { saveWakePhrase(); true } else false
             }
         }
         card.addView(wakeField, full(top = 12))
@@ -701,7 +754,9 @@ class MainActivity : Activity() {
         prefs.countryCode = country.text.toString().filter { it.isDigit() }.ifBlank { "91" }
     }
 
-    private fun testVoice() {
+    private fun testVoice() = playSample("வணக்கம்! I'm Miss Minutes. சொல்லுங்க, என்ன பண்ணணும்?", cache = false)
+
+    private fun playSample(line: String, cache: Boolean) {
         saveKeys()
         scope.launch {
             try {
@@ -710,7 +765,7 @@ class MainActivity : Activity() {
                 player.onLevel = { dial.setLevel(it) }
                 dial.start(withIntro = false)
                 scroll.smoothScrollTo(0, 0)
-                player.speak("வணக்கம்! I'm Miss Minutes. சொல்லுங்க, என்ன பண்ணணும்?", fallback = false)
+                player.speak(line, fallback = false, cache = cache)
             } catch (e: Exception) {
                 toast(e.message ?: "Couldn't play the voice")
             } finally {

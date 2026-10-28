@@ -33,6 +33,9 @@ class SarvamClient(private val prefs: Prefs) {
 
     class SarvamException(val code: Int, msg: String) : IOException(msg)
 
+    /** The voice she speaks with right now. */
+    val speaker: String get() = prefs.sarvamSpeaker
+
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
         .readTimeout(30, TimeUnit.SECONDS)
@@ -56,7 +59,6 @@ class SarvamClient(private val prefs: Prefs) {
      */
     fun speechCall(text: String): Call {
         val lang = if (text.any { it in '஀'..'௿' }) "ta-IN" else "en-IN"
-        val speaker = prefs.sarvamSpeaker
         val payload = JSONObject()
             .put("text", text.take(3000))
             .put("language_code", lang)

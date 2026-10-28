@@ -17,6 +17,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import okhttp3.Call
+import java.io.File
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
 import java.util.Locale
@@ -31,6 +32,11 @@ import kotlin.math.sqrt
  * Falls back to Android's built-in voice if Sarvam fails.
  */
 class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
+    companion object {
+        /** 6 seconds of 16-bit mono audio. */
+        private const val MAX_CACHED_BYTES = SarvamClient.STREAM_RATE * 2L * 6
+    }
+
     private val appContext = context.applicationContext
     var onLevel: ((Float) -> Unit)? = null
 
@@ -49,13 +55,14 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
      * Streams the Sarvam voice: playback starts as soon as the first audio arrives instead of after the
      * whole reply is generated. [onStart] runs the moment sound begins.
      * With [fallback] false, Sarvam errors are thrown instead of using Android's voice.
+     * With [cache] true the audio is kept on the phone, so a phrase said often (a greeting) plays instantly.
      */
-    suspend fun speak(text: String, fallback: Boolean = true, onStart: () -> Unit = {}) {
+    suspend fun speak(text: String, fallback: Boolean = true, cache: Boolean = false, onStart: () -> Unit = {}) {
         if (text.isBlank()) return
         stopRequested = false
         var started = false
         try {
-            streamSarvam(text) { started = true; onStart() }
+            streamSarvam(text, cache) { started = true; onStart() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
@@ -68,9 +75,46 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
         }
     }
 
-    private suspend fun streamSarvam(text: String, onFirstAudio: () -> Unit) = coroutineScope {
+    /**
+     * Downloads and keeps the audio for [texts] without playing it, so they're instant later.
+     * Recordings for anything else (an old name, voice or greeting) are deleted.
+     */
+    suspend fun prefetch(texts: List<String>) = withContext(Dispatchers.IO) {
+        val wanted = texts.map { cacheFile(it) }.toSet()
+        cacheFile("").parentFile?.listFiles()?.filter { it !in wanted }?.forEach { it.delete() }
+        for (text in texts) {
+            val file = cacheFile(text)
+            if (file.exists()) continue
+            runCatching {
+                sarvam.speechCall(text).execute().use { resp ->
+                    val tmp = File(file.path + ".tmp")
+                    sarvam.checked(resp).body!!.byteStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    keepIfSane(tmp, file)
+                }
+            }.onFailure { Log.w("MissMinutes", "Couldn't prefetch voice", it) }
+        }
+    }
+
+    /**
+     * Cached lines are short greetings. The voice occasionally glitches and returns many seconds of noise
+     * for a one-second line (seen: 22 s for "ம்ம், சொல்லுங்க"), so anything that long is thrown away.
+     */
+    private fun keepIfSane(tmp: File, file: File) {
+        if (tmp.length() in 1..MAX_CACHED_BYTES) tmp.renameTo(file)
+        else { Log.w("MissMinutes", "Discarded a ${tmp.length()}-byte voice clip"); tmp.delete() }
+    }
+
+    /** One file per phrase and voice: changing her voice in the app means fresh audio. */
+    private fun cacheFile(text: String): File {
+        val dir = File(appContext.cacheDir, "voice").apply { mkdirs() }
+        val key = "${sarvam.speaker}|$text".hashCode().toUInt().toString(16)
+        return File(dir, "$key.pcm")
+    }
+
+    private suspend fun streamSarvam(text: String, cache: Boolean, onFirstAudio: () -> Unit) = coroutineScope {
         val rate = SarvamClient.STREAM_RATE
-        val call = sarvam.speechCall(text)
+        val cached = if (cache) cacheFile(text).takeIf { it.exists() } else null
+        val call = if (cached == null) sarvam.speechCall(text) else null
         currentCall = call
         val minBuf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val track = AudioTrack.Builder()
@@ -90,14 +134,19 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
         var meter: Job? = null
         try {
             withContext(Dispatchers.IO) {
-                call.execute().use { resp ->
-                    val input = sarvam.checked(resp).body!!.byteStream()
+                // Play from the phone if we have it; otherwise stream from Sarvam (and keep a copy if asked).
+                val resp = call?.execute()
+                val tee = if (cache && cached == null) File(cacheFile(text).path + ".tmp").outputStream() else null
+                var complete = false
+                try {
+                    val input = cached?.inputStream() ?: sarvam.checked(resp!!).body!!.byteStream()
                     val buf = ByteArray(4096)
                     var carry = -1 // a stray odd byte waiting for its partner
-                    while (isActive && !call.isCanceled()) {
+                    while (isActive && !stopRequested && call?.isCanceled() != true) {
                         val n = input.read(buf)
-                        if (n < 0) break
+                        if (n < 0) { complete = true; break }
                         if (n == 0) continue
+                        tee?.write(buf, 0, n)
                         var bytes = if (carry >= 0) byteArrayOf(carry.toByte()) + buf.copyOf(n) else buf.copyOf(n)
                         carry = -1
                         if (bytes.size % 2 == 1) { carry = bytes.last().toInt() and 0xFF; bytes = bytes.copyOf(bytes.size - 1) }
@@ -115,10 +164,17 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
                         }
                         track.write(bytes, 0, bytes.size)
                     }
+                    input.close()
+                } finally {
+                    resp?.close()
+                    tee?.close()
+                    val tmp = File(cacheFile(text).path + ".tmp")
+                    if (tee != null) { if (complete) keepIfSane(tmp, cacheFile(text)) else tmp.delete() }
                 }
                 // Let the last buffered audio play out.
                 val total = levels.frames
-                while (isActive && !call.isCanceled() && meter != null && track.playbackHeadPosition < total) delay(30)
+                while (isActive && !stopRequested && call?.isCanceled() != true && meter != null &&
+                    track.playbackHeadPosition < total) delay(30)
             }
         } finally {
             meter?.cancel()

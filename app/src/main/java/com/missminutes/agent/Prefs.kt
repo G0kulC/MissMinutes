@@ -44,6 +44,12 @@ class Prefs(context: Context) {
     var wakePhrase: String
         get() = WakeWord.normalize(str("wake_phrase", WakeWord.DEFAULT_PHRASE)).ifEmpty { WakeWord.DEFAULT_PHRASE }
         set(v) = putStr("wake_phrase", WakeWord.normalize(v))
+    /** What she calls the user. Empty means she doesn't use a name. */
+    var userName: String get() = str("user_name", ""); set(v) = putStr("user_name", v)
+    /** Say a short hello ("சொல்லுங்க Arun!") when woken, before listening. */
+    var greetOnWake: Boolean get() = bool("greet_on_wake", true); set(v) = putBool("greet_on_wake", v)
+    /** The day (yyyyDDD) of the last greeting, so the first one each morning can say good morning. */
+    var lastGreetDay: Int get() = sp.getInt("last_greet_day", 0); set(v) = sp.edit().putInt("last_greet_day", v).apply()
     /** The welcome screen has been seen. */
     var welcomed: Boolean get() = bool("welcomed", false); set(v) = putBool("welcomed", v)
 

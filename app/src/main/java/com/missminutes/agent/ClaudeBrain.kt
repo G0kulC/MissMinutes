@@ -237,6 +237,10 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
     private fun liveContext(): String = buildString {
         appendLine("Current date and time: " + SimpleDateFormat("EEEE, d MMMM yyyy, h:mm a", Locale.ENGLISH).format(Date()))
         appendLine(if (prefs.confirmBeforeSending) CONFIRM_ON else CONFIRM_OFF)
+        prefs.userName.trim().takeIf { it.isNotEmpty() }?.let {
+            appendLine("The user's name is $it. Use it now and then, the way a friend would, not in every reply.")
+        }
+        if (prefs.greetOnWake) appendLine("You already greeted the user when they woke you, so don't greet them again; just help.")
         if (!prefs.webSearch) appendLine("Web search is turned off. For live information, say you can't look it up right now.")
         val memories = prefs.memories
         if (memories.isNotEmpty()) {

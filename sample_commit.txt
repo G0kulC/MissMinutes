@@ -1,0 +1,8 @@
+Miss Minutes - sample commit file
+
+This file was added as a sample commit to test the repository.
+It can be safely deleted.
+
+Project: Miss Minutes, a personal Android voice agent
+Version: 2.1
+Date: 29 Oct 2026

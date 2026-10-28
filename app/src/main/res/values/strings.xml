@@ -1,0 +1,4 @@
+<resources>
+    <string name="app_name">Miss Minutes</string>
+    <string name="accessibility_desc">Lets Miss Minutes read the screen and use your apps for you: tap, type, scroll, press Send in WhatsApp, go Home or Back, and lock the screen. She only acts when you ask her to.</string>
+</resources>

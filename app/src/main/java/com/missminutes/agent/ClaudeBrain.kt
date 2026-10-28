@@ -1,5 +1,6 @@
 package com.missminutes.agent
 
+import android.util.Log
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -14,6 +15,7 @@ import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 /**
@@ -42,7 +44,9 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
     private var fallbackModel: String? = null
     private var fallbackUntil = 0L
 
-    suspend fun handle(userText: String): String {
+    /** [context]: something she just said that Claude didn't produce (a reminder or alert being answered). */
+    suspend fun handle(spoken: String, context: String? = null): String {
+        val userText = if (context == null) spoken else "(Miss Minutes just told me: \"$context\") $spoken"
         val now = System.currentTimeMillis()
         if (now - lastTurn > 3 * 60_000) history.clear() // fresh conversation after 3 quiet minutes
         lastTurn = now
@@ -50,10 +54,15 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         val messages = JSONArray()
         history.forEach { messages.put(it) }
         messages.put(textMessage("user", userText))
+        // Built once per turn: Claude's thinking blocks are only valid while everything before them, including
+        // the system prompt, stays byte-for-byte the same. Rebuilding it each round (the clock ticking over,
+        // a new memory) made the API reject the turn with "Invalid signature in thinking block".
+        val system = systemPrompt()
 
         var reply = ""
+        var acted = false
         for (round in 0 until MAX_ROUNDS) {
-            val resp = callWithFallback(messages)
+            val resp = callWithFallback(messages, system)
             val content = resp.getJSONArray("content")
             val stopReason = resp.optString("stop_reason")
             messages.put(JSONObject().put("role", "assistant").put("content", content))
@@ -67,8 +76,14 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                     "server_tool_use" -> listener?.onToolStart(
                         block.optString("id"), block.optString("name"), block.optJSONObject("input") ?: JSONObject()
                     )
-                    "web_search_tool_result" -> listener?.onToolEnd(block.optString("tool_use_id"), true)
+                    "web_search_tool_result" -> {
+                        // A failed search still comes back as HTTP 200: the content is an error object, not a list.
+                        val error = block.optJSONObject("content")?.optString("error_code")
+                        if (error != null) Log.w("MissMinutes", "Web search failed: $error")
+                        listener?.onToolEnd(block.optString("tool_use_id"), error == null)
+                    }
                     "tool_use" -> {
+                        acted = true
                         val id = block.getString("id")
                         val name = block.getString("name")
                         val input = block.optJSONObject("input") ?: JSONObject()
@@ -92,6 +107,8 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                 }
             }
             if (texts.isNotBlank()) reply = texts.toString()
+            Log.i("MissMinutes", "Claude round $round: stop=$stopReason blocks=" +
+                (0 until content.length()).joinToString(",") { content.getJSONObject(it).optString("type") })
 
             when {
                 results.length() > 0 -> messages.put(JSONObject().put("role", "user").put("content", results))
@@ -100,7 +117,7 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             }
         }
 
-        reply = speakable(reply).ifBlank { "Done!" }
+        reply = speakable(reply).ifBlank { if (acted) "Done!" else "Sorry, I couldn't work that out. Try asking another way?" }
         history.add(textMessage("user", userText))
         history.add(textMessage("assistant", reply))
         while (history.size > 12) { history.removeAt(0); history.removeAt(0) }
@@ -109,12 +126,16 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
 
     // ---------- API calls ----------
 
-    private suspend fun callWithFallback(messages: JSONArray): JSONObject {
+    private suspend fun callWithFallback(messages: JSONArray, system: JSONArray): JSONObject {
         var model = if (System.currentTimeMillis() < fallbackUntil) fallbackModel ?: prefs.model else prefs.model
         while (true) {
             try {
-                return callWithRetry(model, messages)
+                return callWithRetry(model, messages, system)
             } catch (e: ClaudeException) {
+                if (e.code == 400 && e.message.orEmpty().contains("signature") && stripThinking(messages)) {
+                    Log.w("MissMinutes", "Thinking blocks rejected; retrying without them", e)
+                    continue
+                }
                 val next = BrainModel.fallbackAfter(model)
                 val modelProblem = e.code == 404 || e.code == 529 ||
                     (e.code == 400 && e.message.orEmpty().contains("model", ignoreCase = true))
@@ -127,11 +148,11 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         }
     }
 
-    private suspend fun callWithRetry(model: String, messages: JSONArray): JSONObject {
+    private suspend fun callWithRetry(model: String, messages: JSONArray, system: JSONArray): JSONObject {
         var attempt = 0
         while (true) {
             try {
-                return post(model, messages)
+                return post(model, messages, system)
             } catch (e: ClaudeException) {
                 if (e.code !in RETRYABLE || attempt >= 2) throw e
             } catch (e: CancellationException) {
@@ -144,23 +165,15 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         }
     }
 
-    private suspend fun post(model: String, messages: JSONArray): JSONObject = withContext(Dispatchers.IO) {
+    private suspend fun post(model: String, messages: JSONArray, system: JSONArray): JSONObject = withContext(Dispatchers.IO) {
         val key = prefs.claudeKey
         if (key.isBlank()) throw ClaudeException(401, "missing_key", "Add your Claude API key in the Miss Minutes app")
 
         val tools = JSONArray(TOOLS_JSON)
-        if (prefs.webSearch) {
-            tools.put(JSONObject().put("type", "web_search_20250305").put("name", "web_search").put("max_uses", 3))
-        }
-        // The persona block is cached between requests (cheaper and faster); live details go in a second block.
-        val system = JSONArray()
-            .put(JSONObject().put("type", "text").put("text", PERSONA)
-                .put("cache_control", JSONObject().put("type", "ephemeral")))
-            .put(JSONObject().put("type", "text").put("text", liveContext()))
-
+        if (prefs.webSearch) tools.put(webSearchTool(model))
         val body = JSONObject()
             .put("model", model)
-            .put("max_tokens", 1024)
+            .put("max_tokens", 4096) // room to think and read search results; 1024 cut answers off
             .put("system", system)
             .put("tools", tools)
             .put("messages", messages)
@@ -184,6 +197,41 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             }
             JSONObject(text)
         }
+    }
+
+    /**
+     * Claude's built-in web search. Opus 5.5 and Sonnet 5.5 get the newer version that filters results before
+     * reading them; the others keep the basic one. Location hints make "weather here" mean the user's city.
+     */
+    private fun webSearchTool(model: String): JSONObject {
+        val dynamic = model == BrainModel.SMART.id || model == BrainModel.BALANCED.id
+        return JSONObject()
+            .put("type", if (dynamic) "web_search_20260209" else "web_search_20250305")
+            .put("name", "web_search")
+            .put("max_uses", 5)
+            .put("user_location", JSONObject()
+                .put("type", "approximate")
+                .put("country", Locale.getDefault().country.ifBlank { "IN" })
+                .put("timezone", TimeZone.getDefault().id))
+    }
+
+    // The persona block is cached between requests (cheaper and faster); live details go in a second block.
+    private fun systemPrompt(): JSONArray = JSONArray()
+        .put(JSONObject().put("type", "text").put("text", PERSONA)
+            .put("cache_control", JSONObject().put("type", "ephemeral")))
+        .put(JSONObject().put("type", "text").put("text", liveContext()))
+
+    /** Last resort if the API still rejects thinking blocks: drop them all (removing every one is allowed). */
+    private fun stripThinking(messages: JSONArray): Boolean {
+        var removed = false
+        for (i in 0 until messages.length()) {
+            val content = messages.getJSONObject(i).optJSONArray("content") ?: continue
+            for (j in content.length() - 1 downTo 0) {
+                val type = content.getJSONObject(j).optString("type")
+                if (type == "thinking" || type == "redacted_thinking") { content.remove(j); removed = true }
+            }
+        }
+        return removed
     }
 
     private fun liveContext(): String = buildString {
@@ -226,6 +274,16 @@ Language
 - Reply in the same language mix the user speaks: Tamil to Tamil, English to English, Tanglish to Tanglish.
 - Always write Tamil words in Tamil script and English words in English letters, for example: சரி, John-க்கு message அனுப்பிட்டேன்! Never write Tamil in English letters, because the voice cannot pronounce it.
 
+Answering questions
+- Answer general questions straight away from your own knowledge: facts, meanings, how things work, advice, maths, "what is this", "who is that".
+- For anything that changes over time (weather, news, scores, prices, traffic, timings, today's events, anything recent), call web_search immediately and answer from the results. Never open Google, Chrome or another app to look something up; web_search is faster and you can't read a browser page well.
+- If the user asks about something on their screen ("what is this?"), call read_screen first, then answer.
+
+Reminders and alerts
+- "Remind me…" means set_reminder: she says it out loud and posts a notification at that time. Use set_alarm only when the user says alarm.
+- "Tell me when a message comes", "let me know if Ravi messages", "alert me about any notification" means watch_notifications.
+- Work out times from the current date and time below.
+
 Using the phone
 - Use the tools to act. Prefer a direct tool (send_whatsapp_message, call_contact, open_app, set_alarm and so on) when one fits.
 - For anything else inside an app, work step by step like a person: open_app, then read_screen to see what is there, then tap_text, type_text or scroll, and read_screen again after each step to check what happened. If you are stuck after about 12 steps, stop and tell the user.
@@ -235,7 +293,6 @@ Using the phone
 - Never make payments or purchases, and never delete anything, unless the user clearly says yes first.
 - If a tool returns ERROR, tell the user in a few words what went wrong and what they can do.
 - When the user shares something to remember (names, nicknames, preferences, routines), call remember. If they ask you to forget something, call forget.
-- Use web_search for live information such as news, weather, scores, prices and timings, then answer in one or two spoken sentences.
 - After an action works, confirm it in a few words.
 - When you need an answer from the user, ask one short question that ends with a question mark.
 """.trim()
@@ -345,7 +402,35 @@ Using the phone
   "description":"Delete remembered facts that mention a word or phrase.",
   "input_schema":{"type":"object","properties":{
     "about":{"type":"string"}},
-   "required":["about"]}}
+   "required":["about"]}},
+ {"name":"set_reminder",
+  "description":"Remind the user at a time: Miss Minutes says it out loud and posts a notification. Give minutes_from_now for 'in 20 minutes', or time (and date if not today or the next occurrence).",
+  "input_schema":{"type":"object","properties":{
+    "text":{"type":"string","description":"What to remind about, short, in the user's language"},
+    "minutes_from_now":{"type":"integer"},
+    "time":{"type":"string","description":"24-hour HH:MM, for example 18:30"},
+    "date":{"type":"string","description":"YYYY-MM-DD. Leave out for the next time that clock time comes round."}},
+   "required":["text"]}},
+ {"name":"list_reminders",
+  "description":"List upcoming reminders and active notification watches.",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"cancel_reminder",
+  "description":"Cancel reminders whose text mentions a word, or all of them.",
+  "input_schema":{"type":"object","properties":{
+    "about":{"type":"string","description":"A word from the reminder, or all"}},
+   "required":["about"]}},
+ {"name":"watch_notifications",
+  "description":"Watch incoming notifications and read matching ones out loud as they arrive. With no app, it watches chat messages (WhatsApp, SMS, Telegram, Instagram and others).",
+  "input_schema":{"type":"object","properties":{
+    "from":{"type":"string","description":"Only from this person or group"},
+    "app":{"type":"string","description":"Only from this app, for example Gmail or Swiggy. Use any for every app."},
+    "keyword":{"type":"string","description":"Only notifications mentioning this word"},
+    "hours":{"type":"number","description":"How long to keep watching, up to 24. Default 4."},
+    "once":{"type":"boolean","description":"Stop after the first match. Use for 'tell me when Ravi replies'."}}}},
+ {"name":"stop_watching",
+  "description":"Stop notification watches that mention a word, or all of them.",
+  "input_schema":{"type":"object","properties":{
+    "about":{"type":"string","description":"A name or app from the watch, or all"}}}}
 ]
 """
     }

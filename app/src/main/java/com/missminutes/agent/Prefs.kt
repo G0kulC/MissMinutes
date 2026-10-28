@@ -25,17 +25,27 @@ class Prefs(context: Context) {
     private fun putSecret(key: String, v: String) = putStr("${key}_enc", KeyVault.encrypt(v.trim()))
 
     var claudeKey: String get() = secret("claude_key"); set(v) = putSecret("claude_key", v)
-    var picovoiceKey: String get() = secret("pico_key"); set(v) = putSecret("pico_key", v)
     var sarvamKey: String get() = secret("sarvam_key"); set(v) = putSecret("sarvam_key", v)
 
     var model: String get() = str("model", BrainModel.BEST.id); set(v) = putStr("model", v)
-    var sarvamSpeaker: String get() = str("sarvam_speaker", "anushka"); set(v) = putStr("sarvam_speaker", v)
+    // Falls back to the default if a saved voice was retired by Sarvam (bulbul:v2 voices don't work on v3).
+    var sarvamSpeaker: String
+        get() = str("sarvam_speaker", Voices.default).takeIf { it in Voices.sarvam } ?: Voices.default
+        set(v) = putStr("sarvam_speaker", v)
     var countryCode: String get() = str("country_code", "91"); set(v) = putStr("country_code", v)
 
     var confirmBeforeSending: Boolean get() = bool("confirm", true); set(v) = putBool("confirm", v)
     var webSearch: Boolean get() = bool("web_search", true); set(v) = putBool("web_search", v)
     var keepListening: Boolean get() = bool("keep_listening", false); set(v) = putBool("keep_listening", v)
+    var bargeIn: Boolean get() = bool("barge_in", true); set(v) = putBool("barge_in", v)
     var edgeGlow: Boolean get() = bool("edge_glow", true); set(v) = putBool("edge_glow", v)
+
+    /** What wakes her, in English letters ("hey miss minutes"). Editable in the app; no training needed. */
+    var wakePhrase: String
+        get() = WakeWord.normalize(str("wake_phrase", WakeWord.DEFAULT_PHRASE)).ifEmpty { WakeWord.DEFAULT_PHRASE }
+        set(v) = putStr("wake_phrase", WakeWord.normalize(v))
+    /** The welcome screen has been seen. */
+    var welcomed: Boolean get() = bool("welcomed", false); set(v) = putBool("welcomed", v)
 
     var wakeSensitivity: Float
         get() = sp.getFloat("wake_sensitivity", 0.65f)
@@ -49,14 +59,20 @@ class Prefs(context: Context) {
         }.getOrDefault(emptyList())
         set(v) = putStr("memories", JSONArray(v.takeLast(60)).toString())
 
+    /** Pending reminders and notification watches, as JSON arrays (see Reminders.kt). */
+    var remindersJson: String get() = str("reminders", "[]"); set(v) = putStr("reminders", v)
+    var watchesJson: String get() = str("watches", "[]"); set(v) = putStr("watches", v)
+
     /** v1 stored keys as plain text; move them into encrypted storage. */
     private fun migrateFromV1() {
-        for (k in listOf("claude_key", "pico_key", "sarvam_key")) {
+        for (k in listOf("claude_key", "sarvam_key")) {
             val plain = sp.getString(k, null) ?: continue
             if (plain.isNotBlank() && str("${k}_enc", "").isBlank()) putSecret(k, plain)
             sp.edit().remove(k).apply()
         }
         if (sp.contains("claude_model")) sp.edit().remove("claude_model").apply()
+        // The Picovoice wake word was replaced by Vosk, which needs no key.
+        sp.edit().remove("pico_key").remove("pico_key_enc").apply()
     }
 }
 

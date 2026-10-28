@@ -50,6 +50,11 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         "phone_status" -> phoneStatus()
         "remember" -> remember(input.text("fact"))
         "forget" -> forget(input.text("about"))
+        "set_reminder" -> setReminder(input)
+        "list_reminders" -> listReminders()
+        "cancel_reminder" -> cancelReminder(input.text("about"))
+        "watch_notifications" -> watchNotifications(input)
+        "stop_watching" -> stopWatching(input.text("about"))
         else -> "ERROR: unknown tool $name"
     }
 
@@ -318,6 +323,76 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         prefs.memories = after
         val removed = before.size - after.size
         return if (removed > 0) "Forgot $removed thing(s)." else "Nothing in memory mentions \"$about\"."
+    }
+
+    // ---------- Reminders and notification watches ----------
+
+    private fun setReminder(input: JSONObject): String {
+        val text = input.text("text").ifEmpty { return "ERROR: what should I remind you about?" }
+        val now = System.currentTimeMillis()
+        val minutes = input.optInt("minutes_from_now", 0)
+        val at = if (minutes > 0) {
+            now + minutes * 60_000L
+        } else {
+            val time = input.text("time")
+            val m = Regex("""^(\d{1,2}):(\d{2})$""").find(time)
+                ?: return "ERROR: give minutes_from_now, or time as HH:MM in 24-hour format"
+            val cal = java.util.Calendar.getInstance()
+            val date = input.text("date")
+            if (date.isNotEmpty()) {
+                val d = runCatching { SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).parse(date) }.getOrNull()
+                    ?: return "ERROR: date must be YYYY-MM-DD"
+                cal.time = d
+            }
+            cal.set(java.util.Calendar.HOUR_OF_DAY, m.groupValues[1].toInt().coerceIn(0, 23))
+            cal.set(java.util.Calendar.MINUTE, m.groupValues[2].toInt().coerceIn(0, 59))
+            cal.set(java.util.Calendar.SECOND, 0)
+            cal.set(java.util.Calendar.MILLISECOND, 0)
+            if (date.isEmpty() && cal.timeInMillis <= now) cal.add(java.util.Calendar.DAY_OF_MONTH, 1)
+            cal.timeInMillis
+        }
+        if (at <= now) return "ERROR: that time has already passed"
+        val r = Reminders.add(context, prefs, at, text)
+        val spoken = if (MissMinutesService.running) "I'll say it out loud and post a notification."
+                     else "Miss Minutes is switched off, so it will only appear as a notification."
+        return "Reminder set for ${Reminders.describe(r.at)}: ${r.text}. $spoken"
+    }
+
+    private fun listReminders(): String {
+        val reminders = Reminders.all(prefs)
+        val watches = Watches.active(prefs)
+        if (reminders.isEmpty() && watches.isEmpty()) return "No reminders or notification watches."
+        return buildString {
+            reminders.forEach { appendLine("Reminder ${Reminders.describe(it.at)}: ${it.text}") }
+            watches.forEach { appendLine("Watching for ${it.describe()}") }
+        }.trim()
+    }
+
+    private fun cancelReminder(about: String): String {
+        if (about.isBlank()) return "ERROR: which reminder? Say a word from it, or all."
+        val gone = Reminders.cancel(context, prefs, about)
+        return if (gone.isEmpty()) "No reminder mentions \"$about\"."
+               else "Cancelled: " + gone.joinToString("; ") { "${Reminders.describe(it.at)} ${it.text}" }
+    }
+
+    private fun watchNotifications(input: JSONObject): String {
+        if (NotificationReader.instance == null) return NOTIFICATIONS_OFF
+        val hours = input.optDouble("hours", 4.0).let { if (it.isNaN() || it <= 0) 4.0 else it.coerceAtMost(24.0) }
+        val w = Watches.Watch(
+            from = input.text("from"),
+            app = input.text("app"),
+            keyword = input.text("keyword"),
+            until = System.currentTimeMillis() + (hours * 3_600_000).toLong(),
+            once = input.optBoolean("once", false),
+        )
+        Watches.add(prefs, w)
+        val spoken = if (MissMinutesService.running) "" else " Miss Minutes is switched off, so she can't speak them until it's started."
+        return "Now watching for ${w.describe()}.$spoken"
+    }
+
+    private fun stopWatching(about: String): String {
+        val n = Watches.clear(prefs, about)
+        return if (n == 0) "No notification watch to stop." else "Stopped $n notification watch(es)."
     }
 
     companion object {

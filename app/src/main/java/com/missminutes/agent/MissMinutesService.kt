@@ -1,8 +1,5 @@
 package com.missminutes.agent
 
-import ai.picovoice.porcupine.Porcupine
-import ai.picovoice.porcupine.PorcupineManager
-import ai.picovoice.porcupine.PorcupineManagerCallback
 import android.app.Notification
 import android.app.NotificationChannel
 import android.app.NotificationManager
@@ -25,15 +22,17 @@ import android.widget.Toast
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Deferred
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.async
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONObject
-import java.io.File
 import java.net.SocketTimeoutException
 import java.net.UnknownHostException
 
@@ -48,20 +47,24 @@ class MissMinutesService : Service() {
         const val ACTION_STOP = "stop"
         const val ACTION_TALK = "talk"
         const val ACTION_RELOAD = "reload"
-        const val KEYWORD_FILE = "hey_miss_minutes.ppn"
+        /** Say [EXTRA_TEXT] out loud (a reminder or a watched notification), then listen for a reply. */
+        const val ACTION_ANNOUNCE = "announce"
+        /** Handle [EXTRA_TEXT] as if the user had said it (used by the debug build's test hook). */
+        const val ACTION_ASK = "ask"
+        const val EXTRA_TEXT = "text"
         private const val CHANNEL = "miss_minutes"
         private const val NOTIF_ID = 7
         private const val TAG = "MissMinutes"
         private const val MAX_ROUNDS = 6
+        private val CONFIRM_PHRASES = listOf(
+            "shall i", "should i", "can i", "do you want me to", "want me to", "is that ok", "is that okay",
+            "send it?", "go ahead?", "confirm",
+        )
 
         @Volatile var running = false
 
         fun intent(ctx: Context, action: String) =
             Intent(ctx, MissMinutesService::class.java).setAction(action)
-
-        fun hasCustomWakeWord(ctx: Context) = ctx.assets.list("")?.contains(KEYWORD_FILE) == true
-
-        fun wakeWordName(ctx: Context) = if (hasCustomWakeWord(ctx)) "Hey Miss Minutes" else "Jarvis"
     }
 
     private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
@@ -73,11 +76,16 @@ class MissMinutesService : Service() {
     private lateinit var brain: ClaudeBrain
     private val recorder = VoiceRecorder()
 
-    private var porcupine: PorcupineManager? = null
+    private var wakeWord: WakeWord? = null
+    private var wakeLoading: Job? = null
     private var session: Job? = null
     private var foreground = false
     private var destroyed = false
     private var focusRequest: AudioFocusRequest? = null
+    /** Announcements that arrived while she was busy; spoken once the conversation ends. */
+    private val queued = ArrayDeque<String>()
+    /** An answer given by tapping Yes on the confirmation panel instead of saying it. */
+    @Volatile private var pendingAnswer: String? = null
 
     override fun onBind(intent: Intent?): IBinder? = null
 
@@ -90,17 +98,30 @@ class MissMinutesService : Service() {
         brain = ClaudeBrain(prefs, actions)
         overlay = OverlayManager(this, prefs)
 
-        overlay.onTap = { if (overlay.state == OrbState.SPEAKING) player.stop() else cancelSession() }
+        overlay.onTap = {
+            when (overlay.state) {
+                OrbState.SPEAKING -> player.stop()      // skip the rest of what she's saying
+                OrbState.LISTENING -> recorder.finish() // "I'm done talking"
+                else -> cancelSession()
+            }
+        }
         overlay.onDismiss = { cancelSession() }
+        overlay.onAnswer = { yes ->
+            if (yes) {
+                pendingAnswer = "yes"
+                haptic()
+                player.stop()
+                recorder.cancel()
+            } else {
+                cancelSession()
+            }
+        }
         player.onLevel = { overlay.setLevel(it) }
         brain.listener = object : ClaudeBrain.Listener {
             override fun onToolStart(id: String, name: String, input: JSONObject) =
-                overlay.addChip(id, ToolLabels.label(name, input))
-            override fun onToolEnd(id: String, ok: Boolean) = overlay.finishChip(id, ok)
-            override fun onModelSwitched(model: BrainModel) {
-                overlay.addChip("model-${model.id}", "Using ${model.title}")
-                overlay.finishChip("model-${model.id}", true)
-            }
+                overlay.setActivity(ToolLabels.label(name, input))
+            override fun onToolEnd(id: String, ok: Boolean) {}
+            override fun onModelSwitched(model: BrainModel) = overlay.setActivity("Using ${model.title}")
         }
     }
 
@@ -108,8 +129,17 @@ class MissMinutesService : Service() {
         when (intent?.action) {
             ACTION_STOP -> { stopSelf(); return START_NOT_STICKY }
             ACTION_TALK -> if (ensureForeground()) startSession()
+            ACTION_ANNOUNCE -> intent.getStringExtra(EXTRA_TEXT)?.let { text ->
+                if (ensureForeground()) {
+                    if (session?.isActive == true) queued.addLast(text) else startSession(intro = text)
+                }
+            }
+            ACTION_ASK -> intent.getStringExtra(EXTRA_TEXT)?.let { text ->
+                if (ensureForeground()) startSession(typed = text)
+            }
             ACTION_RELOAD -> {
-                releaseWakeWord()
+                stopWakeWord()
+                if (foreground) getSystemService(NotificationManager::class.java).notify(NOTIF_ID, buildNotification())
                 if (foreground && session?.isActive != true) startWakeWord()
             }
             else -> if (ensureForeground()) startWakeWord()
@@ -119,22 +149,34 @@ class MissMinutesService : Service() {
 
     // ---------- Foreground notification ----------
 
-    private fun ensureForeground(): Boolean {
-        if (foreground) return true
-        val nm = getSystemService(NotificationManager::class.java)
-        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Miss Minutes", NotificationManager.IMPORTANCE_LOW))
+    /** The quiet, always-there notification: what to say, plus Talk and Stop. */
+    private fun buildNotification(): Notification {
         val open = PendingIntent.getActivity(this, 0, Intent(this, MainActivity::class.java), PendingIntent.FLAG_IMMUTABLE)
         val talk = PendingIntent.getService(this, 1, intent(this, ACTION_TALK), PendingIntent.FLAG_IMMUTABLE)
         val stop = PendingIntent.getService(this, 2, intent(this, ACTION_STOP), PendingIntent.FLAG_IMMUTABLE)
-        val notification = Notification.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_btn_speak_now)
-            .setContentTitle("Miss Minutes is ready")
-            .setContentText("Say \"${wakeWordName(this)}\"")
+        return Notification.Builder(this, CHANNEL)
+            .setSmallIcon(R.drawable.ic_stat_minutes)
+            .setColor(Palette.AMBER)
+            .setContentTitle("Say “${WakeWord.display(prefs.wakePhrase)}”")
+            .setContentText("Miss Minutes is listening for you. Tap Talk to speak now.")
             .setContentIntent(open)
             .setOngoing(true)
-            .addAction(Notification.Action.Builder(null as Icon?, "Talk", talk).build())
-            .addAction(Notification.Action.Builder(null as Icon?, "Stop", stop).build())
+            .setShowWhen(false)
+            .setCategory(Notification.CATEGORY_SERVICE)
+            .setVisibility(Notification.VISIBILITY_PUBLIC)
+            .addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_mic), "Talk", talk).build())
+            .addAction(Notification.Action.Builder(Icon.createWithResource(this, R.drawable.ic_power), "Stop", stop).build())
             .build()
+    }
+
+    private fun ensureForeground(): Boolean {
+        if (foreground) return true
+        val nm = getSystemService(NotificationManager::class.java)
+        nm.createNotificationChannel(NotificationChannel(CHANNEL, "Miss Minutes", NotificationManager.IMPORTANCE_LOW).apply {
+            description = "Shows while she's listening for the wake word"
+            setShowBadge(false)
+        })
+        val notification = buildNotification()
         return try {
             if (Build.VERSION.SDK_INT >= 30) {
                 startForeground(NOTIF_ID, notification, ServiceInfo.FOREGROUND_SERVICE_TYPE_MICROPHONE)
@@ -155,51 +197,46 @@ class MissMinutesService : Service() {
 
     private fun startWakeWord() {
         if (destroyed) return
-        if (prefs.picovoiceKey.isBlank()) {
-            toast("Add your Picovoice key in the Miss Minutes app")
+        wakeWord?.let { ww ->
+            try {
+                ww.start(prefs.wakePhrase, prefs.wakeSensitivity)
+            } catch (e: Exception) {
+                Log.e(TAG, "Wake word failed", e)
+                toast("Wake word error: ${e.message}")
+            }
             return
         }
-        try {
-            if (porcupine == null) {
-                val builder = PorcupineManager.Builder()
-                    .setAccessKey(prefs.picovoiceKey)
-                    .setSensitivity(prefs.wakeSensitivity)
-                val custom = copyKeywordFile()
-                if (custom != null) builder.setKeywordPath(custom)
-                else builder.setKeyword(Porcupine.BuiltInKeyword.JARVIS)
-                porcupine = builder.build(applicationContext, PorcupineManagerCallback {
-                    scope.launch { startSession() }
-                })
+        if (wakeLoading?.isActive == true) return
+        // The model loads (and downloads, the first time) in the background, then listening starts.
+        wakeLoading = scope.launch {
+            try {
+                if (!WakeWord.modelReady(this@MissMinutesService)) {
+                    toast("Downloading the wake word model (about 40 MB, one time only)…")
+                }
+                val loaded = withContext(Dispatchers.IO) { WakeWord.load(applicationContext) }
+                loaded.onWake = { startSession() }
+                wakeWord = loaded
+                WakeWord.shared = loaded
+                if (session?.isActive != true) startWakeWord()
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                Log.e(TAG, "Wake word failed", e)
+                toast("Wake word error: ${e.message}")
             }
-            porcupine?.start()
-        } catch (e: Exception) {
-            Log.e(TAG, "Wake word failed", e)
-            toast("Wake word error: ${e.message}")
         }
     }
 
     private fun stopWakeWord() {
-        runCatching { porcupine?.stop() }
-    }
-
-    private fun releaseWakeWord() {
-        runCatching { porcupine?.stop() }
-        runCatching { porcupine?.delete() }
-        porcupine = null
-    }
-
-    private fun copyKeywordFile(): String? {
-        if (!hasCustomWakeWord(this)) return null
-        val out = File(filesDir, KEYWORD_FILE)
-        assets.open(KEYWORD_FILE).use { input -> out.outputStream().use { input.copyTo(it) } }
-        return out.absolutePath
+        wakeWord?.stop()
     }
 
     // ---------- One conversation ----------
 
-    private fun startSession() {
+    /** [intro]: something she says first (a reminder or alert). [typed]: a request given as text instead of voice. */
+    private fun startSession(intro: String? = null, typed: String? = null) {
         if (session?.isActive == true) return
-        session = scope.launch { runSession() }
+        session = scope.launch { runSession(intro, typed) }
     }
 
     private fun cancelSession() {
@@ -208,45 +245,67 @@ class MissMinutesService : Service() {
         session?.cancel()
     }
 
-    private suspend fun runSession() {
+    private suspend fun runSession(intro: String? = null, typed: String? = null) {
         stopWakeWord()
+        pendingAnswer = typed
         overlay.show()
-        overlay.setState(OrbState.LISTENING)
+        overlay.setState(if (intro != null) OrbState.SPEAKING else OrbState.LISTENING)
         haptic()
         requestAudioFocus()
         delay(180)
         try {
             var rounds = 0
             var waitMs = 6000L
+            var alreadySaid: ByteArray? = null
+            // Claude didn't hear the announcement, so the first reply to it carries it along as context.
+            var context = intro
+            if (intro != null) {
+                alreadySaid = speak(intro) { overlay.setState(OrbState.SPEAKING) }
+                waitMs = 5000L
+            }
             while (true) {
                 overlay.setState(OrbState.LISTENING)
-                overlay.showHint(if (rounds == 0) "Listening…" else "Go ahead…")
-                val wav = withContext(Dispatchers.IO) {
-                    recorder.record(waitMs) { overlay.setLevel(it) }
-                } ?: break
+                var heard = takeAnswer()
+                if (heard == null) {
+                    val wav = withContext(Dispatchers.IO) {
+                        recorder.record(waitMs, alreadySaid) { overlay.setLevel(it) }
+                    }
+                    alreadySaid = null
+                    heard = takeAnswer() ?: wav?.let {
+                        overlay.setState(OrbState.THINKING)
+                        sarvam.transcribe(it)
+                    }
+                }
+                if (heard.isNullOrBlank()) break
 
+                overlay.hidePanel()
                 overlay.setState(OrbState.THINKING)
-                overlay.showHint("…")
-                val heard = sarvam.transcribe(wav)
-                if (heard.isBlank()) break
-                overlay.showHeard(heard)
-
                 actions.quietAfterAction = false
-                val reply = brain.handle(heard)
+                val reply = brain.handle(heard, context)
+                context = null
                 if (actions.quietAfterAction) {
                     overlay.setState(OrbState.SPEAKING)
-                    overlay.showReply(reply)
-                    delay(1400)
+                    delay(900)
                     break
                 }
-                player.speak(reply) {
+                val asked = reply.trimEnd().endsWith("?")
+                val cutIn = speak(reply) {
                     overlay.setState(OrbState.SPEAKING)
-                    overlay.showReply(reply)
+                    if (asked) {
+                        val kind = if (isConfirmation(reply)) OverlayManager.PanelKind.CONFIRM
+                                   else OverlayManager.PanelKind.QUESTION
+                        overlay.showPanel(reply, kind)
+                    }
                 }
 
                 rounds++
-                val asked = reply.trimEnd().endsWith("?")
-                if ((asked || prefs.keepListening) && rounds < MAX_ROUNDS) {
+                if (rounds >= MAX_ROUNDS) break
+                if (cutIn != null || pendingAnswer != null) { // you talked over her, or tapped Yes
+                    alreadySaid = cutIn
+                    waitMs = 6000L
+                    continue
+                }
+                if (asked || prefs.keepListening) {
                     waitMs = if (asked) 6000L else 4000L
                     continue
                 }
@@ -259,9 +318,9 @@ class MissMinutesService : Service() {
             Log.e(TAG, "Conversation failed", e)
             val message = friendlyError(e)
             overlay.setState(OrbState.SPEAKING)
-            overlay.showReply(message)
+            overlay.showPanel(message, OverlayManager.PanelKind.PROBLEM)
             runCatching { player.speak(message) }
-            delay(1200)
+            delay(2500)
         } finally {
             withContext(NonCancellable) {
                 overlay.hide()
@@ -269,7 +328,41 @@ class MissMinutesService : Service() {
                 abandonAudioFocus()
                 startWakeWord()
             }
+            if (queued.isNotEmpty()) scope.launch {
+                delay(400)
+                queued.removeFirstOrNull()?.let { startSession(intro = it) }
+            }
         }
+    }
+
+    private fun takeAnswer(): String? = pendingAnswer?.also { pendingAnswer = null }
+
+    /**
+     * Speaks [text]. With barge-in on, the mic listens while she talks: if you start speaking she stops
+     * straight away, and the audio of your first words is returned so the next recording can carry on from it.
+     */
+    private suspend fun speak(text: String, onStart: () -> Unit): ByteArray? = coroutineScope {
+        val bargeIn = if (prefs.bargeIn) BargeIn() else null
+        var listening: Deferred<ByteArray?>? = null
+        try {
+            player.speak(text) {
+                onStart()
+                if (bargeIn != null) listening = this@coroutineScope.async(Dispatchers.IO) {
+                    bargeIn.listen { player.stop(); haptic() }
+                }
+            }
+        } finally {
+            bargeIn?.cancel()
+        }
+        listening?.await()
+    }
+
+    /** Her question asks you to approve something ("…அனுப்பட்டுமா?", "Shall I call Amma?"). */
+    private fun isConfirmation(reply: String): Boolean {
+        val q = reply.trim()
+        if (Regex("""(ட்டுமா|டுமா|லாமா)\s*\?$""").containsMatchIn(q)) return true
+        val lower = q.lowercase()
+        return CONFIRM_PHRASES.any { it in lower }
     }
 
     private fun friendlyError(e: Exception): String = when {
@@ -319,7 +412,9 @@ class MissMinutesService : Service() {
         running = false
         recorder.cancel()
         session?.cancel()
-        releaseWakeWord()
+        wakeLoading?.cancel()
+        wakeWord?.release()
+        wakeWord = null
         overlay.hide()
         player.shutdown()
         abandonAudioFocus()

@@ -11,8 +11,8 @@ android {
         applicationId = "com.missminutes.agent"
         minSdk = 26
         targetSdk = 35
-        versionCode = 2
-        versionName = "2.0"
+        versionCode = 3
+        versionName = "2.1"
     }
     buildTypes {
         release { isMinifyEnabled = false }
@@ -27,6 +27,7 @@ android {
 dependencies {
     implementation("org.jetbrains.kotlinx:kotlinx-coroutines-android:1.8.1")
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
-    // Wake word engine. The .ppn file from Picovoice Console must match this major version (v3).
-    implementation("ai.picovoice:porcupine-android:3.0.2")
+    // Offline wake word engine (no key needed). The model is downloaded on first start.
+    implementation("net.java.dev.jna:jna:5.13.0@aar")
+    implementation("com.alphacephei:vosk-android:0.3.47@aar")
 }

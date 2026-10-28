@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Themed-icon version (Android 13+): one colour, the phone tints it. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp" android:viewportWidth="108" android:viewportHeight="108">
+    <path android:strokeColor="#FFFFFFFF" android:strokeWidth="2.4" android:strokeLineCap="round"
+        android:pathData="M54.00,31.00L54.00,25.50M65.50,34.08L68.25,29.32M73.92,42.50L78.68,39.75M77.00,54.00L82.50,54.00M73.92,65.50L78.68,68.25M65.50,73.92L68.25,78.68M54.00,77.00L54.00,82.50M42.50,73.92L39.75,78.68M34.08,65.50L29.32,68.25M31.00,54.00L25.50,54.00M34.08,42.50L29.32,39.75M42.50,34.08L39.75,29.32" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M54,54m-13,0a13,13 0,1 1,26 0a13,13 0,1 1,-26 0" />
+</vector>

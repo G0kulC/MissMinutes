@@ -17,17 +17,28 @@ class VoiceRecorder {
         const val SAMPLE_RATE = 16000
         private const val CHUNK = 800              // 50 ms
         private const val CALIBRATION_CHUNKS = 6   // first 300 ms measures room noise
-        private const val END_SILENCE_MS = 1200L
+        private const val END_SILENCE_MS = 850L
         private const val MAX_MS = 15000L
     }
 
     @Volatile private var cancelled = false
+    @Volatile private var finishing = false
     fun cancel() { cancelled = true }
+    /** Stop now and keep what was said (a tap on the orb meaning "I'm done talking"). */
+    fun finish() { finishing = true }
 
-    /** Blocking. Returns WAV bytes, or null if nothing was said within [waitForSpeechMs]. */
+    /**
+     * Blocking. Returns WAV bytes, or null if nothing was said within [waitForSpeechMs].
+     * [alreadySaid] is PCM you started saying before recording began (when you cut in while she was talking).
+     */
     @SuppressLint("MissingPermission")
-    fun record(waitForSpeechMs: Long = 6000L, onLevel: (Float) -> Unit = {}): ByteArray? {
+    fun record(
+        waitForSpeechMs: Long = 6000L,
+        alreadySaid: ByteArray? = null,
+        onLevel: (Float) -> Unit = {},
+    ): ByteArray? {
         cancelled = false
+        finishing = false
         val minBuf = AudioRecord.getMinBufferSize(
             SAMPLE_RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT
         )
@@ -49,10 +60,17 @@ class VoiceRecorder {
         var speechStarted = false
         val start = System.currentTimeMillis()
         var lastSpeech = start
+        if (alreadySaid != null) {
+            // You're mid-sentence: skip measuring room noise, which would mistake your voice for it.
+            pcm.write(alreadySaid)
+            speechStarted = true
+            noiseChunks = CALIBRATION_CHUNKS
+            threshold = 900.0
+        }
 
         recorder.startRecording()
         try {
-            while (!cancelled) {
+            while (!cancelled && !finishing) {
                 val n = recorder.read(buf, 0, CHUNK)
                 if (n <= 0) continue
                 bytes.clear()

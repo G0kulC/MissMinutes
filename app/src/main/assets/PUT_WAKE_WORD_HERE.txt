@@ -1,3 +1,0 @@
-Put your Picovoice wake word file here, renamed to exactly:
-hey_miss_minutes.ppn
-Until then, the wake word is "Jarvis".

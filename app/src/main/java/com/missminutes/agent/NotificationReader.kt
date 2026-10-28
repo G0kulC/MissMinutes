@@ -8,8 +8,12 @@ import android.content.Intent
 import android.os.Bundle
 import android.service.notification.NotificationListenerService
 import android.service.notification.StatusBarNotification
+import android.util.Log
 
-/** Collects incoming chat notifications so Miss Minutes can read them out and reply. */
+/**
+ * Collects incoming chat notifications so Miss Minutes can read them out and reply, and checks every new
+ * notification against the watches the user asked for ("tell me when Ravi messages").
+ */
 class NotificationReader : NotificationListenerService() {
 
     data class Message(
@@ -82,7 +86,30 @@ class NotificationReader : NotificationListenerService() {
 
     override fun onListenerDisconnected() { instance = null }
 
-    override fun onNotificationPosted(sbn: StatusBarNotification?) { sbn?.let { capture(it) } }
+    override fun onNotificationPosted(sbn: StatusBarNotification?) {
+        sbn ?: return
+        capture(sbn)
+        runCatching { watch(sbn) }.onFailure { Log.w("MissMinutes", "Notification watch failed", it) }
+    }
+
+    private val prefs by lazy { Prefs(this) }
+
+    private fun watch(sbn: StatusBarNotification) {
+        if (sbn.packageName == packageName) return
+        val n = sbn.notification ?: return
+        if (n.flags and (Notification.FLAG_GROUP_SUMMARY or Notification.FLAG_ONGOING_EVENT) != 0) return
+        if (Watches.active(prefs).isEmpty()) return
+        val extras = n.extras ?: return
+        val title = extras.getCharSequence(Notification.EXTRA_TITLE)?.toString()?.trim().orEmpty()
+        val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
+            ?.toString()?.trim().orEmpty()
+        if (text.isEmpty() || SUMMARY.matches(text)) return
+        val chatApp = CHAT_APPS[sbn.packageName]
+        val app = chatApp ?: runCatching {
+            packageManager.getApplicationLabel(packageManager.getApplicationInfo(sbn.packageName, 0)).toString()
+        }.getOrDefault(sbn.packageName)
+        Watches.check(this, prefs, app, chatApp != null, title, text)
+    }
 
     private fun capture(sbn: StatusBarNotification) {
         val app = CHAT_APPS[sbn.packageName] ?: return

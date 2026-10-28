@@ -2,7 +2,7 @@ package com.missminutes.agent
 
 import org.json.JSONObject
 
-/** Short, human labels for the action chips on the floating card. */
+/** Short, human labels for what she's doing, read out by TalkBack from the orb. */
 object ToolLabels {
     fun label(name: String, input: JSONObject): String {
         fun s(key: String) = input.optString(key).trim().takeUnless { it.isEmpty() || it == "null" } ?: ""
@@ -35,6 +35,11 @@ object ToolLabels {
             "phone_status" -> "Checking the phone"
             "remember" -> "Remembering"
             "forget" -> "Forgetting"
+            "set_reminder" -> "Reminder: ${s("text")}"
+            "list_reminders" -> "Checking reminders"
+            "cancel_reminder" -> "Cancelling reminder"
+            "watch_notifications" -> if (s("from").isNotEmpty()) "Watching for ${s("from")}" else "Watching notifications"
+            "stop_watching" -> "Stopping alerts"
             "web_search" -> if (s("query").isNotEmpty()) "Searching: ${s("query")}" else "Searching the web"
             else -> name.replace('_', ' ')
         }

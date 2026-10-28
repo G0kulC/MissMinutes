@@ -17,7 +17,14 @@ enum class BrainModel(val id: String, val title: String, val blurb: String) {
     }
 }
 
-/** Sarvam Bulbul voices. Check docs.sarvam.ai if Sarvam adds or renames voices. */
+/**
+ * Sarvam Bulbul voices. Plain names are bulbul:v3 (all tested with Tamil); styled names are the faster
+ * bulbul:v4-flash. Check docs.sarvam.ai if Sarvam adds or renames voices.
+ */
 object Voices {
-    val sarvam = listOf("anushka", "manisha", "vidya", "arya", "abhilash", "karun", "hitesh")
+    val sarvam = listOf(
+        "kavya", "priya", "shruti", "kavitha", "ritu", "neha", "gokul", "vijay", "mani",
+        "shalini_en_companion", "roopa_en_conversational", "gokul_ta_narration",
+    )
+    val default = sarvam.first()
 }

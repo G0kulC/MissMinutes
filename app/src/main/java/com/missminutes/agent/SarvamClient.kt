@@ -1,26 +1,34 @@
 package com.missminutes.agent
 
-import android.util.Base64
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
+import okhttp3.Call
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.MultipartBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
-import org.json.JSONArray
+import okhttp3.Response
 import org.json.JSONObject
 import java.io.IOException
 import java.util.concurrent.TimeUnit
 
-/** Sarvam AI: Saarika (speech to text) and Bulbul (text to speech) for Tamil, English and Tanglish. */
+/** Sarvam AI: Saaras (speech to text) and Bulbul (streamed text to speech) for Tamil, English and Tanglish. */
 class SarvamClient(private val prefs: Prefs) {
     companion object {
         // If Sarvam renames models or fields, update them here (see docs.sarvam.ai).
         const val STT_URL = "https://api.sarvam.ai/speech-to-text"
-        const val TTS_URL = "https://api.sarvam.ai/text-to-speech"
-        const val STT_MODEL = "saarika:v2.5"
-        const val TTS_MODEL = "bulbul:v2"
+        const val TTS_STREAM_URL = "https://api.sarvam.ai/text-to-speech/stream"
+        const val STT_MODEL = "saaras:v4"
+        // Tamil + codemix: Tamil words in Tamil script, English words in English. Auto-detect ("unknown")
+        // mistook Tamil and Tanglish for Hindi or Telugu, and pure English still comes out as English.
+        const val STT_LANGUAGE = "ta-IN"
+        const val STT_MODE = "codemix"
+        /** Speech arrives as raw 16-bit mono PCM at this rate. */
+        const val STREAM_RATE = 22050
+
+        /** v4-flash voices have styled names like "shalini_en_companion"; the plain names are bulbul:v3. */
+        fun ttsModel(speaker: String) = if ('_' in speaker) "bulbul:v4-flash" else "bulbul:v3"
     }
 
     class SarvamException(val code: Int, msg: String) : IOException(msg)
@@ -34,41 +42,44 @@ class SarvamClient(private val prefs: Prefs) {
         val body = MultipartBody.Builder().setType(MultipartBody.FORM)
             .addFormDataPart("file", "speech.wav", wav.toRequestBody("audio/wav".toMediaType()))
             .addFormDataPart("model", STT_MODEL)
-            .addFormDataPart("language_code", "unknown") // auto-detects Tamil, English or a mix
+            .addFormDataPart("language_code", STT_LANGUAGE)
+            .addFormDataPart("mode", STT_MODE)
             .build()
-        call(Request.Builder().url(STT_URL).post(body)).optString("transcript").trim()
-    }
-
-    suspend fun synthesize(text: String): ByteArray = withContext(Dispatchers.IO) {
-        val lang = if (text.any { it in '\u0B80'..'\u0BFF' }) "ta-IN" else "en-IN"
-        val clean = text.take(480)
-        val base = JSONObject()
-            .put("target_language_code", lang)
-            .put("speaker", prefs.sarvamSpeaker)
-            .put("model", TTS_MODEL)
-        val json = try {
-            post(JSONObject(base.toString()).put("text", clean))
-        } catch (e: SarvamException) {
-            // Older API versions expected "inputs": [text]
-            if (e.code in 400..422) post(JSONObject(base.toString()).put("inputs", JSONArray().put(clean)))
-            else throw e
+        http.newCall(authed(Request.Builder().url(STT_URL).post(body))).execute().use { resp ->
+            JSONObject(checked(resp).body!!.string()).optString("transcript").trim()
         }
-        Base64.decode(json.getJSONArray("audios").getString(0), Base64.DEFAULT)
     }
 
-    private fun post(payload: JSONObject): JSONObject = call(
-        Request.Builder().url(TTS_URL)
+    /**
+     * A call that streams [text] as speech. Execute it, pass the response through [checked], then read raw
+     * PCM ([STREAM_RATE] Hz, 16-bit, mono) from the body as it's generated. Cancel the call to stop early.
+     */
+    fun speechCall(text: String): Call {
+        val lang = if (text.any { it in '஀'..'௿' }) "ta-IN" else "en-IN"
+        val speaker = prefs.sarvamSpeaker
+        val payload = JSONObject()
+            .put("text", text.take(3000))
+            .put("language_code", lang)
+            .put("speaker", speaker)
+            .put("model", ttsModel(speaker))
+            .put("output_audio_codec", "linear16")
+            .put("speech_sample_rate", STREAM_RATE)
+        val req = Request.Builder().url(TTS_STREAM_URL)
             .post(payload.toString().toRequestBody("application/json".toMediaType()))
-    )
+        return http.newCall(authed(req))
+    }
 
-    private fun call(builder: Request.Builder): JSONObject {
+    fun checked(resp: Response): Response {
+        if (!resp.isSuccessful) {
+            val text = resp.body?.string().orEmpty()
+            throw SarvamException(resp.code, "Sarvam ${resp.code}: ${text.take(200)}")
+        }
+        return resp
+    }
+
+    private fun authed(builder: Request.Builder): Request {
         val key = prefs.sarvamKey
         if (key.isBlank()) throw SarvamException(401, "Add your Sarvam API key in the Miss Minutes app")
-        val req = builder.header("api-subscription-key", key).build()
-        http.newCall(req).execute().use { resp ->
-            val text = resp.body?.string().orEmpty()
-            if (!resp.isSuccessful) throw SarvamException(resp.code, "Sarvam ${resp.code}: ${text.take(200)}")
-            return JSONObject(text)
-        }
+        return builder.header("api-subscription-key", key).build()
     }
 }

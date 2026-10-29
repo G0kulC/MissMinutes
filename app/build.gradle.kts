@@ -30,4 +30,6 @@ dependencies {
     // Offline wake word engine (no key needed). The model is downloaded on first start.
     implementation("net.java.dev.jna:jna:5.13.0@aar")
     implementation("com.alphacephei:vosk-android:0.3.47@aar")
+    // The ghost's animations (assets/ghost, made by tools/ghost_lottie.py).
+    implementation("com.airbnb.android:lottie:6.4.0")
 }

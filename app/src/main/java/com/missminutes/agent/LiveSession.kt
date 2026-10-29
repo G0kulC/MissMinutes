@@ -56,6 +56,8 @@ class LiveSession(
         fun state(s: OrbState)
         fun level(v: Float)
         fun activity(label: String)
+        fun toolStarted(name: String)
+        fun toolEnded(name: String, ok: Boolean)
     }
 
     companion object {
@@ -197,6 +199,7 @@ class LiveSession(
         val params = call.optJSONObject("parameters") ?: JSONObject()
         toolsRunning++
         ui.activity(ToolLabels.label(name, params))
+        ui.toolStarted(name)
         val result = try {
             if (name == "think_deeper") brain.handle(params.optString("task"), deep = true)
             else actions.run(name, params)
@@ -209,6 +212,7 @@ class LiveSession(
             lastActivity = System.currentTimeMillis()
         }
         Log.i(TAG, "Live tool $name: ${result.take(120)}")
+        ui.toolEnded(name, !result.startsWith("ERROR"))
         socket.send(JSONObject()
             .put("type", "client_tool_result")
             .put("tool_call_id", call.optString("tool_call_id"))

@@ -111,6 +111,8 @@ class MissMinutesService : Service() {
             override fun state(s: OrbState) { main.post { overlay.setState(s) } }
             override fun level(v: Float) { main.post { overlay.setLevel(v) } }
             override fun activity(label: String) { main.post { overlay.setActivity(label) } }
+            override fun toolStarted(name: String) { main.post { overlay.toolStarted(name) } }
+            override fun toolEnded(name: String, ok: Boolean) { main.post { overlay.toolEnded(name, ok) } }
         })
 
         overlay.onTap = {
@@ -133,9 +135,15 @@ class MissMinutesService : Service() {
         }
         player.onLevel = { overlay.setLevel(it) }
         brain.listener = object : ClaudeBrain.Listener {
-            override fun onToolStart(id: String, name: String, input: JSONObject) =
+            private val names = HashMap<String, String>()
+            override fun onToolStart(id: String, name: String, input: JSONObject) {
+                names[id] = name
                 overlay.setActivity(ToolLabels.label(name, input))
-            override fun onToolEnd(id: String, ok: Boolean) {}
+                overlay.toolStarted(name)
+            }
+            override fun onToolEnd(id: String, ok: Boolean) {
+                overlay.toolEnded(names.remove(id) ?: return, ok)
+            }
             override fun onModelSwitched(model: BrainModel) = overlay.setActivity("Using ${model.title}")
         }
     }
@@ -266,6 +274,7 @@ class MissMinutesService : Service() {
         pendingAnswer = typed
         overlay.show()
         overlay.setState(if (intro != null) OrbState.SPEAKING else OrbState.LISTENING)
+        if (intro != null) overlay.flash(Mood.NOTIFICATION, 2500) // a reminder or alert arriving
         haptic()
         requestAudioFocus()
         delay(180)

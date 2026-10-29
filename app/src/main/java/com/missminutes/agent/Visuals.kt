@@ -1,168 +1,115 @@
 package com.missminutes.agent
 
-import android.animation.ArgbEvaluator
 import android.animation.ValueAnimator
 import android.content.Context
 import android.graphics.Canvas
-import android.graphics.Color
 import android.graphics.Matrix
 import android.graphics.Paint
-import android.graphics.RadialGradient
 import android.graphics.RectF
-import android.graphics.Shader
 import android.graphics.SweepGradient
 import android.os.SystemClock
 import android.view.View
-import kotlin.math.PI
-import kotlin.math.cos
-import kotlin.math.min
-import kotlin.math.sin
+import android.widget.ImageView
+import com.airbnb.lottie.LottieCompositionFactory
+import com.airbnb.lottie.LottieDrawable
 
 enum class OrbState { IDLE, LISTENING, THINKING, SPEAKING }
 
-fun stateColor(s: OrbState) = when (s) {
-    OrbState.IDLE -> Palette.PLUM
-    OrbState.LISTENING -> Palette.AMBER
-    OrbState.THINKING -> Palette.TEAL
-    OrbState.SPEAKING -> Palette.CORAL
+/** The ghost's moods, one Lottie file each in assets/ghost (drawn by tools/ghost_lottie.py). */
+enum class Mood(val asset: String) {
+    IDLE("ghost/idle.json"),
+    LISTENING("ghost/listening.json"),
+    LOADING("ghost/loading.json"),
+    NOTIFICATION("ghost/notification.json"),
+    SLEEPING("ghost/sleeping.json"),
+    SPEAKING("ghost/speaking.json"),
+    SUCCESS("ghost/success.json"),
+    ERROR("ghost/error.json"),
+    TYPING("ghost/typing.json"),
 }
 
 /**
- * The minute dial: 60 ticks around a glowing core, like a clock face that reacts to sound.
- * Idle: a lit second hand ticks round. Listening: ticks stretch with your voice.
- * Working: a bright sweep races round. Speaking: ticks pulse with her voice.
+ * Miss Minutes as a little ghost. [state] picks her mood: listening, thinking (typing while she works inside
+ * your apps), speaking. [flash] shows a one-off mood for a moment: success, error, a new notification.
+ * Stopped, she sleeps. She swells a little with the voice level.
  */
-class MinuteDialView(context: Context) : View(context) {
+class GhostView(context: Context) : ImageView(context) {
 
     var state: OrbState = OrbState.IDLE
         set(value) {
-            if (field == value) return
-            fromPrimary = primary; fromSecondary = secondary
             field = value
-            transitionStart = SystemClock.uptimeMillis()
-            invalidate()
+            if (value != OrbState.THINKING) inApps = false
+            refresh()
         }
+
+    /** Thinking while working inside your apps shows her typing on a laptop instead of the thinking ring. */
+    var inApps = false
+        set(value) { field = value; refresh() }
 
     @Volatile private var targetLevel = 0f
-    private var level = 0f
+    private var voice = 0f
+    private var awake = true
+    private var flashMood: Mood? = null
+    private var shown: Mood? = null
+    private val motion = ValueAnimator.areAnimatorsEnabled()
+    private val endFlash = Runnable { flashMood = null; refresh() }
+    // Played as a drawable in a plain ImageView: LottieAnimationView would pull in AppCompat, which the app doesn't use.
+    private val lottie = LottieDrawable().apply {
+        repeatCount = LottieDrawable.INFINITE
+        addAnimatorUpdateListener {
+            voice += (targetLevel - voice) * 0.25f
+            val s = 1f + 0.08f * voice
+            this@GhostView.scaleX = s
+            this@GhostView.scaleY = s
+        }
+    }
+
+    init {
+        scaleType = ScaleType.FIT_CENTER
+        setImageDrawable(lottie)
+        refresh()
+    }
+
+    override fun onDetachedFromWindow() {
+        super.onDetachedFromWindow()
+        removeCallbacks(endFlash)
+        lottie.cancelAnimation()
+    }
+
+    /** Safe from any thread: it only stores a number read each frame. */
     fun setLevel(v: Float) { targetLevel = v.coerceIn(0f, 1f) }
 
-    private var running = false
-    private var introStart = 0L
-    private val born = SystemClock.uptimeMillis()
-    private var transitionStart = 0L
-    private val motion = ValueAnimator.areAnimatorsEnabled()
+    /** Awake again, showing the mood for [state]. */
+    @Suppress("UNUSED_PARAMETER")
+    fun start(withIntro: Boolean = true) { awake = true; refresh() }
 
-    private var primary = stateColor(OrbState.IDLE)
-    private var secondary = Palette.PLUM
-    private var fromPrimary = primary
-    private var fromSecondary = secondary
-    private val evaluator = ArgbEvaluator()
+    /** Asleep: eyes closed, z z z. */
+    fun stop() { awake = false; refresh() }
 
-    private val tickPaint = Paint(Paint.ANTI_ALIAS_FLAG).apply {
-        style = Paint.Style.STROKE
-        strokeCap = Paint.Cap.ROUND
-    }
-    private val fillPaint = Paint(Paint.ANTI_ALIAS_FLAG)
-
-    /** [withIntro] sweeps the ticks in clockwise, the moment she wakes up. */
-    fun start(withIntro: Boolean = true) {
-        running = motion
-        introStart = if (withIntro && motion) SystemClock.uptimeMillis() else 0L
-        invalidate()
+    fun flash(mood: Mood, ms: Long = 1600) {
+        removeCallbacks(endFlash)
+        flashMood = mood
+        refresh()
+        postDelayed(endFlash, ms)
     }
 
-    fun stop() { running = false; invalidate() }
-
-    private fun secondaryFor(s: OrbState) = when (s) {
-        OrbState.IDLE -> Palette.AMBER
-        OrbState.LISTENING -> Palette.CORAL
-        OrbState.THINKING -> Palette.CREAM
-        OrbState.SPEAKING -> Palette.AMBER
-    }
-
-    private fun blend(a: Int, b: Int, f: Float) = evaluator.evaluate(f, a, b) as Int
-
-    override fun onDraw(canvas: Canvas) {
-        val now = SystemClock.uptimeMillis()
-        val t = (now - born) / 1000f
-        level += (targetLevel - level) * 0.25f
-
-        val p = if (transitionStart == 0L) 1f else ((now - transitionStart) / 260f).coerceIn(0f, 1f)
-        primary = blend(fromPrimary, stateColor(state), p)
-        secondary = blend(fromSecondary, secondaryFor(state), p)
-
-        val size = min(width, height).toFloat()
-        if (size <= 0f) return
-        val cx = width / 2f
-        val cy = height / 2f
-        val ring = size * 0.31f
-        val intro = if (introStart == 0L) 1f else ((now - introStart) / 450f).coerceIn(0f, 1f)
-
-        // Soft glow behind the dial
-        val glowAlpha = 50 + (110 * level).toInt() + if (state == OrbState.THINKING) 30 else 0
-        fillPaint.shader = RadialGradient(
-            cx, cy, size * 0.5f,
-            intArrayOf(Palette.alpha(primary, glowAlpha), Palette.alpha(primary, 0)),
-            null, Shader.TileMode.CLAMP
-        )
-        canvas.drawCircle(cx, cy, size * 0.5f, fillPaint)
-        fillPaint.shader = null
-
-        // 60 minute ticks
-        for (i in 0 until 60) {
-            if (i / 60f > intro) break
-            val major = i % 5 == 0
-            var len = if (major) size * 0.05f else size * 0.028f
-            var alpha = if (major) 170 else 85
-            when (state) {
-                OrbState.IDLE -> if (running) {
-                    val second = (t % 60f).toInt()
-                    val behind = (second - i + 60) % 60
-                    if (behind < 6) alpha = maxOf(alpha, 255 - behind * 32)
-                }
-                OrbState.LISTENING -> {
-                    val wave = 0.55f + 0.45f * sin(i * 0.55f + t * 7f)
-                    len += size * 0.10f * level * wave
-                    alpha = (110 + 145 * min(1f, level * 1.4f + 0.15f)).toInt()
-                }
-                OrbState.THINKING -> {
-                    val head = (t * 0.85f % 1f) * 60f
-                    val behind = (head - i + 60f) % 60f
-                    if (behind < 16f) {
-                        val k = 1f - behind / 16f
-                        alpha = maxOf(alpha, (255 * k).toInt())
-                        len += size * 0.045f * k
-                    }
-                }
-                OrbState.SPEAKING -> {
-                    val wave = 0.6f + 0.4f * sin(i * 0.9f - t * 9f)
-                    len += size * 0.085f * level * wave
-                    alpha = (120 + 135 * level).toInt()
-                }
-            }
-            val angle = (i / 60f) * 2f * PI.toFloat() - PI.toFloat() / 2f
-            val c = cos(angle)
-            val s = sin(angle)
-            tickPaint.strokeWidth = if (major) size * 0.016f else size * 0.01f
-            tickPaint.color = Palette.alpha(if (major) primary else blend(primary, secondary, 0.45f), alpha)
-            canvas.drawLine(cx + c * ring, cy + s * ring, cx + c * (ring + len), cy + s * (ring + len), tickPaint)
+    private fun refresh() {
+        val mood = flashMood ?: if (!awake) Mood.SLEEPING else when (state) {
+            OrbState.IDLE -> Mood.IDLE
+            OrbState.LISTENING -> Mood.LISTENING
+            OrbState.THINKING -> if (inApps) Mood.TYPING else Mood.LOADING
+            OrbState.SPEAKING -> Mood.SPEAKING
         }
-
-        // Glowing core
-        var coreR = size * 0.17f * (1f + 0.15f * level) * intro
-        if (state == OrbState.THINKING && running) coreR *= 0.94f + 0.04f * sin(t * 5f)
-        if (coreR > 0f) {
-            fillPaint.shader = RadialGradient(
-                cx - coreR * 0.35f, cy - coreR * 0.35f, coreR * 1.5f,
-                intArrayOf(Palette.CREAM, primary, blend(primary, Color.BLACK, 0.55f)),
-                floatArrayOf(0f, 0.45f, 1f), Shader.TileMode.CLAMP
-            )
-            canvas.drawCircle(cx, cy, coreR, fillPaint)
-            fillPaint.shader = null
+        if (mood == shown) return
+        shown = mood
+        // Lottie caches each file after the first load, so switching moods is instant from then on.
+        LottieCompositionFactory.fromAsset(context, mood.asset).addListener { composition ->
+            if (shown != mood) return@addListener // the mood changed again while this one loaded
+            lottie.composition = composition
+            setImageDrawable(null) // makes the ImageView re-measure the drawable's new size
+            setImageDrawable(lottie)
+            if (motion) lottie.playAnimation() else lottie.progress = 0.3f // reduced motion: a still pose
         }
-
-        if (running || p < 1f || intro < 1f) postInvalidateOnAnimation()
     }
 }
 

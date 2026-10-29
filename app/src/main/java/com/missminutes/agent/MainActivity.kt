@@ -60,7 +60,7 @@ class MainActivity : Activity() {
     private lateinit var root: FrameLayout
     private lateinit var scroll: ScrollView
     private lateinit var content: LinearLayout
-    private lateinit var dial: MinuteDialView
+    private lateinit var dial: GhostView
     private lateinit var statusChip: TextView
     private lateinit var heroTitle: TextView
     private lateinit var heroDetail: TextView
@@ -184,7 +184,7 @@ class MainActivity : Activity() {
             gravity = Gravity.CENTER_HORIZONTAL
             setPadding(dpi(28), dpi(24), dpi(28), dpi(28))
         }
-        val bigDial = MinuteDialView(this).apply { state = OrbState.LISTENING }
+        val bigDial = GhostView(this).apply { state = OrbState.IDLE }
         board.addView(bigDial, LinearLayout.LayoutParams(dpi(220), dpi(220)).apply { topMargin = dpi(12) })
         board.addView(text("Hi, I'm Miss Minutes", 32f, Fonts.BOLD, Palette.CREAM).apply {
             gravity = Gravity.CENTER
@@ -274,7 +274,7 @@ class MainActivity : Activity() {
     private fun buildHero() {
         val card = card(top = 8)
         card.gravity = Gravity.CENTER_HORIZONTAL
-        dial = MinuteDialView(this)
+        dial = GhostView(this)
         card.addView(dial, LinearLayout.LayoutParams(dpi(168), dpi(168)).apply { gravity = Gravity.CENTER_HORIZONTAL })
         statusChip = text("", 13f, Fonts.SEMIBOLD, Palette.CREAM).apply {
             setPadding(dpi(12), dpi(5), dpi(12), dpi(5))

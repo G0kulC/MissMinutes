@@ -27,8 +27,8 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * What you see when you wake Miss Minutes: just the round minute dial at the bottom of the screen
- * (amber listening, teal working, coral speaking). Tap it to skip her speaking or stop; swipe it down to close.
+ * What you see when you wake Miss Minutes: the little ghost at the bottom of the screen, whose mood follows
+ * what she's doing (listening, thinking, typing in your apps, speaking, happy when it worked, sad when it failed). Tap it to skip her speaking or stop; swipe it down to close.
  * When she asks you something, a panel slides up above the orb with her question, Yes / Cancel buttons
  * for confirmations, and a short hint underneath.
  */
@@ -37,7 +37,7 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
     private val motion = ValueAnimator.areAnimatorsEnabled()
 
     private var orb: FrameLayout? = null
-    @Volatile private var dial: MinuteDialView? = null
+    @Volatile private var dial: GhostView? = null
     private var edge: EdgeGlowView? = null
     private var panel: LinearLayout? = null
     private var activity: String? = null
@@ -62,7 +62,7 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
         if (orb != null || !canShow()) return
         if (prefs.edgeGlow) addEdgeGlow()
 
-        val dialView = MinuteDialView(context)
+        val dialView = GhostView(context)
         val disc = View(context).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -130,6 +130,24 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
         describe()
     }
 
+    /** A tool started: work inside your apps shows the ghost typing on her laptop. */
+    fun toolStarted(name: String) {
+        dial?.inApps = name in APP_TOOLS
+    }
+
+    /** A tool finished: a quick happy face when an action worked, a frown when it failed. Lookups stay quiet. */
+    fun toolEnded(name: String, ok: Boolean) {
+        when {
+            !ok -> dial?.flash(Mood.ERROR, 1800)
+            name in ACTION_TOOLS -> dial?.flash(Mood.SUCCESS, 1400)
+        }
+    }
+
+    /** Shows a one-off mood for a moment (a reminder or alert arriving). */
+    fun flash(mood: Mood, ms: Long = 1600) {
+        dial?.flash(mood, ms)
+    }
+
     private fun describe() {
         val view = orb ?: return
         val what = when (state) {
@@ -148,6 +166,7 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
     fun showPanel(message: String, kind: PanelKind) {
         if (orb == null || !canShow()) return
         hidePanel(animated = false)
+        if (kind == PanelKind.PROBLEM) dial?.flash(Mood.ERROR, 3000)
 
         val accent = when (kind) {
             PanelKind.CONFIRM -> Palette.AMBER
@@ -397,5 +416,17 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
 
     companion object {
         private const val ORB_DP = 112
+        /** Tools that work inside other apps on screen. */
+        private val APP_TOOLS = setOf(
+            "read_screen", "tap_text", "type_text", "scroll", "open_app", "play_on_youtube", "phone_navigation",
+            "send_whatsapp_message",
+        )
+        /** Tools that change something, worth a happy face when they work. */
+        private val ACTION_TOOLS = setOf(
+            "send_whatsapp_message", "send_sms", "call_contact", "reply_to_message", "set_alarm", "set_timer",
+            "flashlight", "set_volume", "set_brightness", "sound_mode", "media_control", "add_calendar_event",
+            "set_reminder", "cancel_reminder", "watch_notifications", "stop_watching", "remember", "forget",
+            "save_routine", "delete_routine",
+        )
     }
 }

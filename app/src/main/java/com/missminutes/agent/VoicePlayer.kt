@@ -27,11 +27,21 @@ import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 
+/** A service that streams speech as 16-bit mono PCM at [SarvamClient.STREAM_RATE] Hz. */
+interface TtsEngine {
+    /** Names the voice, so cached clips are kept per voice. */
+    val speaker: String
+    fun speechCall(text: String): okhttp3.Call
+    fun checked(resp: okhttp3.Response): okhttp3.Response
+    /** Another service to try if this one fails before any sound. */
+    val backup: TtsEngine? get() = null
+}
+
 /**
- * Speaks with the Sarvam voice and reports loudness while playing, so the dial moves in sync.
- * Falls back to Android's built-in voice if Sarvam fails.
+ * Speaks with the chosen voice (Sarvam or ElevenLabs) and reports loudness while playing, so the dial moves in sync.
+ * Falls back to Sarvam, then to Android's built-in voice, if that fails.
  */
-class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
+class VoicePlayer(context: Context, private val voice: TtsEngine) {
     companion object {
         /** 6 seconds of 16-bit mono audio. */
         private const val MAX_CACHED_BYTES = SarvamClient.STREAM_RATE * 2L * 6
@@ -62,14 +72,25 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
         stopRequested = false
         var started = false
         try {
-            streamSarvam(text, cache) { started = true; onStart() }
+            stream(text, cache, voice) { started = true; onStart() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             if (stopRequested) return
-            if (started) { Log.w("MissMinutes", "Sarvam voice stream broke off", e); return }
+            if (started) { Log.w("MissMinutes", "Voice stream broke off", e); return }
             if (!fallback) throw e
-            Log.w("MissMinutes", "Sarvam voice failed, using Android voice", e)
+            voice.backup?.let { backup ->
+                Log.w("MissMinutes", "Voice failed, using Sarvam instead", e)
+                try {
+                    stream(text, false, backup) { started = true; onStart() }
+                    return
+                } catch (e2: CancellationException) {
+                    throw e2
+                } catch (e2: Exception) {
+                    if (stopRequested || started) return
+                }
+            }
+            Log.w("MissMinutes", "Voice failed, using Android voice", e)
             onStart()
             speakWithAndroid(text)
         }
@@ -86,9 +107,9 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
             val file = cacheFile(text)
             if (file.exists()) continue
             runCatching {
-                sarvam.speechCall(text).execute().use { resp ->
+                voice.speechCall(text).execute().use { resp ->
                     val tmp = File(file.path + ".tmp")
-                    sarvam.checked(resp).body!!.byteStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
+                    voice.checked(resp).body!!.byteStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
                     keepIfSane(tmp, file)
                 }
             }.onFailure { Log.w("MissMinutes", "Couldn't prefetch voice", it) }
@@ -110,14 +131,14 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
     /** One file per phrase and voice: changing her voice in the app means fresh audio. */
     private fun cacheFile(text: String): File {
         val dir = File(appContext.cacheDir, "voice").apply { mkdirs() }
-        val key = "${sarvam.speaker}|$text".hashCode().toUInt().toString(16)
+        val key = "${voice.speaker}|$text".hashCode().toUInt().toString(16)
         return File(dir, "$key.pcm")
     }
 
-    private suspend fun streamSarvam(text: String, cache: Boolean, onFirstAudio: () -> Unit) = coroutineScope {
+    private suspend fun stream(text: String, cache: Boolean, engine: TtsEngine, onFirstAudio: () -> Unit) = coroutineScope {
         val rate = SarvamClient.STREAM_RATE
         val cached = if (cache) cacheFile(text).takeIf { it.exists() } else null
-        val call = if (cached == null) sarvam.speechCall(text) else null
+        val call = if (cached == null) engine.speechCall(text) else null
         currentCall = call
         val minBuf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val track = AudioTrack.Builder()
@@ -142,7 +163,7 @@ class VoicePlayer(context: Context, private val sarvam: SarvamClient) {
                 val tee = if (cache && cached == null) File(cacheFile(text).path + ".tmp").outputStream() else null
                 var complete = false
                 try {
-                    val input = cached?.inputStream() ?: sarvam.checked(resp!!).body!!.byteStream()
+                    val input = cached?.inputStream() ?: engine.checked(resp!!).body!!.byteStream()
                     val buf = ByteArray(4096)
                     var carry = -1 // a stray odd byte waiting for its partner
                     while (isActive && !stopRequested && call?.isCanceled() != true) {

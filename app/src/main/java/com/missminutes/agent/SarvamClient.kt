@@ -14,7 +14,7 @@ import java.io.IOException
 import java.util.concurrent.TimeUnit
 
 /** Sarvam AI: Saaras (speech to text) and Bulbul (streamed text to speech) for Tamil, English and Tanglish. */
-class SarvamClient(private val prefs: Prefs) {
+class SarvamClient(private val prefs: Prefs) : TtsEngine {
     companion object {
         // If Sarvam renames models or fields, update them here (see docs.sarvam.ai).
         const val STT_URL = "https://api.sarvam.ai/speech-to-text"
@@ -34,7 +34,7 @@ class SarvamClient(private val prefs: Prefs) {
     class SarvamException(val code: Int, msg: String) : IOException(msg)
 
     /** The voice she speaks with right now. */
-    val speaker: String get() = prefs.sarvamSpeaker
+    override val speaker: String get() = prefs.sarvamSpeaker
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -57,7 +57,7 @@ class SarvamClient(private val prefs: Prefs) {
      * A call that streams [text] as speech. Execute it, pass the response through [checked], then read raw
      * PCM ([STREAM_RATE] Hz, 16-bit, mono) from the body as it's generated. Cancel the call to stop early.
      */
-    fun speechCall(text: String): Call {
+    override fun speechCall(text: String): Call {
         val lang = if (text.any { it in '஀'..'௿' }) "ta-IN" else "en-IN"
         val payload = JSONObject()
             .put("text", text.take(3000))
@@ -71,7 +71,7 @@ class SarvamClient(private val prefs: Prefs) {
         return http.newCall(authed(req))
     }
 
-    fun checked(resp: Response): Response {
+    override fun checked(resp: Response): Response {
         if (!resp.isSuccessful) {
             val text = resp.body?.string().orEmpty()
             throw SarvamException(resp.code, "Sarvam ${resp.code}: ${text.take(200)}")

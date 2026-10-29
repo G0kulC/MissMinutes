@@ -143,25 +143,54 @@ class WakeWord private constructor(private val model: Model) {
         val trigger = core(full)
         val grammar = JSONArray(listOf(full, trigger, "[unk]").distinct()).toString()
         val onPartial = sensitivity >= 0.75f
-        val rec = Recognizer(model, RATE, grammar)
+        // How sure Vosk must be of every wake word: 0.95 at the lowest sensitivity, 0.65 at the highest.
+        val minConf = 0.95 - (sensitivity - 0.3) * 0.5
+        val rec = Recognizer(model, RATE, grammar).apply { setWords(true) }
         val svc = SpeechService(rec, RATE)
         recognizer = rec
         service = svc
         svc.startListening(object : RecognitionListener {
             override fun onPartialResult(hypothesis: String?) {
-                if (onPartial) check(hypothesis, "partial", trigger)
+                if (onPartial) check(hypothesis, "partial", trigger, minConf)
             }
-            override fun onResult(hypothesis: String?) = check(hypothesis, "text", trigger)
-            override fun onFinalResult(hypothesis: String?) = check(hypothesis, "text", trigger)
+            override fun onResult(hypothesis: String?) = check(hypothesis, "text", trigger, minConf)
+            override fun onFinalResult(hypothesis: String?) = check(hypothesis, "text", trigger, minConf)
             override fun onError(e: Exception?) { Log.e(TAG, "Wake word error", e) }
             override fun onTimeout() {}
         })
     }
 
-    private fun check(hypothesis: String?, field: String, trigger: String) {
+    /**
+     * Vosk only knows the wake phrase, so it squeezes any sound (a cough, the TV, people nearby) into those
+     * words. A real wake has every word heard with confidence and takes as long as speaking it does.
+     * Partial results (high sensitivity) carry no confidence, so they wake straight away.
+     */
+    private fun check(hypothesis: String?, field: String, trigger: String, minConf: Double) {
         if (service == null || hypothesis == null) return
-        val heard = runCatching { JSONObject(hypothesis).optString(field) }.getOrDefault("")
-        if (trigger in heard) onWake()
+        val json = runCatching { JSONObject(hypothesis) }.getOrNull() ?: return
+        val heard = json.optString(field)
+        if (trigger !in heard) return
+        if (field == "partial") {
+            Log.i(TAG, "Wake: \"$heard\" (partial) -> yes")
+            onWake()
+            return
+        }
+        val want = trigger.split(' ')
+        val words = json.optJSONArray("result")
+        val all = List(words?.length() ?: 0) { words!!.getJSONObject(it) }
+        val start = (0..all.size - want.size).firstOrNull { i ->
+            want.indices.all { all[i + it].optString("word") == want[it] }
+        }
+        if (start == null) {
+            Log.i(TAG, "Wake: \"$heard\" without word details -> no")
+            return
+        }
+        val match = all.subList(start, start + want.size)
+        val conf = match.minOf { it.optDouble("conf", 0.0) }
+        val span = match.last().optDouble("end") - match.first().optDouble("start")
+        val ok = conf >= minConf && span >= 0.2 * want.size
+        Log.i(TAG, "Wake: \"$heard\" conf=%.2f (needs %.2f) span=%.2fs -> %s".format(conf, minConf, span, if (ok) "yes" else "no"))
+        if (ok) onWake()
     }
 
     /** Stops listening and frees the microphone. */

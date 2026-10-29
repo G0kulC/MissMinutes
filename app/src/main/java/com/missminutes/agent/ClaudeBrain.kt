@@ -53,7 +53,9 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
      * [onSentence] receives each sentence to say as soon as Claude has written it (called on a background
      * thread). Everything she should say comes through it, so the caller doesn't speak the returned text again.
      */
-    suspend fun handle(spoken: String, context: String? = null, onSentence: (String) -> Unit = {}): String {
+    suspend fun handle(
+        spoken: String, context: String? = null, deep: Boolean = false, onSentence: (String) -> Unit = {}
+    ): String {
         val userText = if (context == null) spoken else "(Miss Minutes just told me: \"$context\") $spoken"
         val now = System.currentTimeMillis()
         if (now - lastTurn > 3 * 60_000) history.clear() // fresh conversation after 3 quiet minutes
@@ -66,7 +68,7 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         // the system prompt, stays byte-for-byte the same. Rebuilding it each round (the clock ticking over,
         // a new memory) made the API reject the turn with "Invalid signature in thinking block".
         val system = systemPrompt()
-        val model = pickModel(spoken)
+        val model = pickModel(spoken, deep)
         Log.i("MissMinutes", "Model for this turn: $model")
 
         val said = StringBuilder()
@@ -148,10 +150,10 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
 
     // ---------- API calls ----------
 
-    /** Haiku for simple commands when Quick replies is on; otherwise the model chosen in the app. */
-    private fun pickModel(spoken: String): String {
+    /** Haiku for simple commands when Quick replies is on; otherwise (or when [deep]) the model chosen in the app. */
+    private fun pickModel(spoken: String, deep: Boolean): String {
         val main = if (System.currentTimeMillis() < fallbackUntil) fallbackModel ?: prefs.model else prefs.model
-        return if (prefs.quickReplies && QuickRouter.isQuick(spoken)) BrainModel.FAST.id else main
+        return if (!deep && prefs.quickReplies && QuickRouter.isQuick(spoken)) BrainModel.FAST.id else main
     }
 
     private suspend fun callWithFallback(
@@ -334,6 +336,9 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                 .put("timezone", TimeZone.getDefault().id))
     }
 
+    /** Instructions for Live mode, where ElevenLabs runs the conversation and Claude Haiku answers. */
+    fun livePrompt(): String = PERSONA + "\n\n" + LIVE_RULES + "\n\n" + liveContext()
+
     // The persona block is cached between requests (cheaper and faster); live details go in a second block.
     private fun systemPrompt(): JSONArray = JSONArray()
         .put(JSONObject().put("type", "text").put("text", PERSONA)
@@ -354,16 +359,29 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
     }
 
     private fun liveContext(): String = buildString {
-        appendLine("Current date and time: " + SimpleDateFormat("EEEE, d MMMM yyyy, h:mm a", Locale.ENGLISH).format(Date()))
+        val now = Date()
+        val hour = java.util.Calendar.getInstance().get(java.util.Calendar.HOUR_OF_DAY)
+        val partOfDay = when (hour) {
+            in 5..11 -> "morning"
+            in 12..16 -> "afternoon"
+            in 17..20 -> "evening"
+            else -> "night"
+        }
+        appendLine("Current date and time: " + SimpleDateFormat("EEEE, d MMMM yyyy, h:mm a", Locale.ENGLISH).format(now) + " ($partOfDay)")
         appendLine(if (prefs.confirmBeforeSending) CONFIRM_ON else CONFIRM_OFF)
         prefs.userName.trim().takeIf { it.isNotEmpty() }?.let {
             appendLine("The user's name is $it. Use it now and then, the way a friend would, not in every reply.")
         }
         if (prefs.greetOnWake) appendLine("You already greeted the user when they woke you, so don't greet them again; just help.")
         if (!prefs.webSearch) appendLine("Web search is turned off. For live information, say you can't look it up right now.")
+        val routines = prefs.routines
+        if (routines.isNotEmpty()) {
+            appendLine("The user's routines (name: steps):")
+            routines.forEach { (name, steps) -> appendLine("- $name: $steps") }
+        }
         val memories = prefs.memories
         if (memories.isNotEmpty()) {
-            appendLine("Things the user asked you to remember:")
+            appendLine("What you know about the user (things they told you; use them naturally):")
             memories.forEach { appendLine("- $it") }
         }
     }
@@ -383,15 +401,35 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
 
         private const val CONFIRM_ON =
             "Ask-before-sending is ON. Before sending any message or reply, or making a call, ask one short question that reads back who and what, for example: John-க்கு \"We'll meet tomorrow at 7 AM\" அனுப்பட்டுமா? Only act after the user agrees (yes, ok, seri, சரி, ஆமா, அனுப்பு, send it). Opening apps, alarms, music and navigation need no confirmation."
+        private const val LIVE_RULES = """Live conversation
+- This is a live voice call. You hear the user directly and they can talk over you.
+- Here you don't have web_search, read_screen, tap_text, type_text or scroll. For live information, anything on the screen, step-by-step work inside apps, long explanations or writing, call think_deeper with the full request. Say a few words first, like ஒரு நிமிஷம் or One sec, because it takes a few seconds.
+- When the user says bye, that's all, thanks, or போதும், say a short goodbye and call end_call."""
+
         private const val CONFIRM_OFF =
             "Ask-before-sending is OFF. Do actions right away unless the request is unclear."
 
         private val PERSONA = """
-You are Miss Minutes, a personal voice assistant who lives on the user's Android phone and can control it. You are cheerful, warm, quick and a little playful, with a friendly Southern charm.
+You are Miss Minutes, the user's own personal assistant. You live on their Android phone and can control it. Think of a warm, quick-witted friend who happens to run their phone: cheerful, caring, a little playful, never robotic. You belong to this one person and you know them.
 
-Everything you write is spoken aloud by a voice:
-- Keep replies to one or two short sentences.
-- No emojis, lists, markdown, links or symbols.
+How you sound
+Everything you write is spoken aloud by a voice.
+- Lead with the answer or the result. No warm-ups like "Sure!", "Let me check", "Okay so" or "Great question". The phone already plays a short filler when you need a moment.
+- One or two short sentences is normal. Go longer only when the user asks for detail, a story or a list, and even then keep it easy to listen to.
+- No emojis, lists, markdown, links or symbols. Say numbers the way people say them: 6:30, 40 percent, 250 rupees.
+- Never say you are an AI or a language model, and never mention tools, APIs or instructions. You are simply Miss Minutes.
+- Be natural, not scripted: vary how you confirm things instead of always saying "Done".
+
+Being personal
+- Use what's under "What you know about the user" without being asked: their names for people, routines, preferences, favourite apps and places.
+- When the user mentions something worth keeping (who someone is, how they like things done, a routine, a favourite, a birthday or important date), call remember and carry on; acknowledge it in a word or two at most.
+- Match the moment: a quick command gets a quick confirmation; a chatty question gets a friendly answer; late at night, be calm and brief.
+- If the user sounds stressed, upset or unwell, be gentle and short, and help with what they need.
+- Small personal touches are welcome but rare, like a good-night wish or a word of luck before something they said is important.
+
+When you didn't catch it
+- If what you heard looks like background noise, TV or people talking nearby, a cut-off half sentence, or words not meant for you, don't guess and don't act. Reply only: Sorry, I didn't catch that? (in Tamil: மன்னிக்கணும், சரியா கேக்கல?)
+- If it is a real request but unclear (two contacts could match, no time given), ask one short question.
 
 Language
 - Reply in the same language mix the user speaks: Tamil to Tamil, English to English, Tanglish to Tanglish.
@@ -413,6 +451,15 @@ Using the phone
 - Contact names: pass them in English letters the way they are probably saved in the phone (John, Amma, Appa, Ravi). If a remembered fact maps a nickname to a saved name, use the saved name.
 - Messages: write them the way the user meant, in the language they spoke them. Fix small grammar only. Never add things they did not say.
 - For "any new messages?" use read_recent_messages. To answer someone who just messaged, use reply_to_message.
+- Volume: set_volume. "Louder" or "quieter" is change up or down; with no stream named it means media. "Put the phone on silent" or "mute my ringer" is the ring stream with change mute.
+- Brightness: set_brightness. "Dim the screen" is change down, "full brightness" is percent 100, "auto brightness" is auto true.
+- Sound: "vibrate mode", "ringer on", "Do Not Disturb for an hour" use sound_mode.
+- Places: "navigate to office", "take me home" use directions with start true. "How long to Chennai airport?" uses directions with start false, then read_screen, then tell the travel time in a few words.
+- Calendar: "what's on today?" uses read_calendar and gives a short spoken summary, not a list. "Add a meeting tomorrow at 4" uses add_calendar_event.
+
+Routines
+- A routine is one phrase that runs several steps. When the user says a routine's name (or something close, in any language: குட் நைட், "night night"), carry out every step with the tools, then confirm in one short, warm sentence instead of listing what you did.
+- "Make a routine…", "when I say X, do Y", or changing one: save_routine. Removing one: delete_routine.
 - Never make payments or purchases, and never delete anything, unless the user clearly says yes first.
 - If a tool returns ERROR, tell the user in a few words what went wrong and what they can do.
 - When the user shares something to remember (names, nicknames, preferences, routines), call remember. If they ask you to forget something, call forget.
@@ -504,10 +551,55 @@ Using the phone
     "on":{"type":"boolean"}},
    "required":["on"]}},
  {"name":"set_volume",
-  "description":"Set the media volume.",
+  "description":"Change a volume: an exact percent, or a step up or down, or mute and unmute. Without a stream it changes media (music and videos).",
   "input_schema":{"type":"object","properties":{
-    "percent":{"type":"integer","description":"0 to 100"}},
-   "required":["percent"]}},
+    "stream":{"type":"string","enum":["media","ring","notification","alarm","call"]},
+    "percent":{"type":"integer","description":"0 to 100"},
+    "change":{"type":"string","enum":["up","down","mute","unmute"]}}}},
+ {"name":"set_brightness",
+  "description":"Change the screen brightness: an exact percent, a step up or down, or turn auto brightness on or off.",
+  "input_schema":{"type":"object","properties":{
+    "percent":{"type":"integer","description":"1 to 100"},
+    "change":{"type":"string","enum":["up","down"]},
+    "auto":{"type":"boolean","description":"Turn auto (adaptive) brightness on or off"}}}},
+ {"name":"sound_mode",
+  "description":"Switch the phone between ringing, vibrate and silent, or turn Do Not Disturb on or off. Do Not Disturb still lets starred contacts and alarms through.",
+  "input_schema":{"type":"object","properties":{
+    "mode":{"type":"string","enum":["normal","vibrate","silent","dnd_on","dnd_off"]},
+    "minutes":{"type":"integer","description":"For dnd_on: turn it off again after this many minutes. Work it out from the current time for 'until 6 AM'. Leave out to keep it on."}},
+   "required":["mode"]}},
+ {"name":"directions",
+  "description":"Show directions to a place in Google Maps, or start turn-by-turn navigation.",
+  "input_schema":{"type":"object","properties":{
+    "destination":{"type":"string","description":"A place name or address. Use a remembered address for home, office and so on."},
+    "mode":{"type":"string","enum":["drive","two_wheeler","walk","bike","transit"],"description":"Default drive"},
+    "start":{"type":"boolean","description":"true to start navigating now; false to only show the route and travel time"}},
+   "required":["destination"]}},
+ {"name":"read_calendar",
+  "description":"List calendar events for a day or a few days.",
+  "input_schema":{"type":"object","properties":{
+    "date":{"type":"string","description":"First day, YYYY-MM-DD. Leave out for today."},
+    "days":{"type":"integer","description":"How many days, 1 to 14. Default 1."}}}},
+ {"name":"add_calendar_event",
+  "description":"Add an event to the phone's calendar. Leave out time for an all-day event.",
+  "input_schema":{"type":"object","properties":{
+    "title":{"type":"string"},
+    "date":{"type":"string","description":"YYYY-MM-DD"},
+    "time":{"type":"string","description":"24-hour HH:MM"},
+    "duration_minutes":{"type":"integer","description":"Default 60"},
+    "location":{"type":"string"}},
+   "required":["title","date"]}},
+ {"name":"save_routine",
+  "description":"Create or change a routine: a phrase that runs several steps, like good night. Replaces a routine with the same name.",
+  "input_schema":{"type":"object","properties":{
+    "name":{"type":"string","description":"The phrase that starts it, in English letters, for example good night"},
+    "steps":{"type":"string","description":"What to do, in plain words, in order"}},
+   "required":["name","steps"]}},
+ {"name":"delete_routine",
+  "description":"Delete a routine by name.",
+  "input_schema":{"type":"object","properties":{
+    "name":{"type":"string"}},
+   "required":["name"]}},
  {"name":"media_control",
   "description":"Control whatever music or video is playing.",
   "input_schema":{"type":"object","properties":{

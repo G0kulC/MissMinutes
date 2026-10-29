@@ -4,6 +4,8 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.media.audiofx.NoiseSuppressor
+import android.util.Log
 import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 import java.nio.ByteOrder
@@ -18,7 +20,11 @@ class VoiceRecorder {
         private const val CHUNK = 800              // 50 ms
         private const val CALIBRATION_CHUNKS = 6   // first 300 ms measures room noise
         private const val END_SILENCE_MS = 850L
+        private const val MIN_SPEECH_CHUNKS = 5    // 250 ms of voice; a click or a cough isn't a request
         private const val MAX_MS = 15000L
+        private const val NOISE_MARGIN = 2.5      // your voice must be this many times louder than the room
+
+        private fun thresholdFor(noise: Double) = (noise * NOISE_MARGIN).coerceIn(800.0, 3500.0)
     }
 
     @Volatile private var cancelled = false
@@ -50,22 +56,29 @@ class VoiceRecorder {
             recorder.release()
             throw IllegalStateException("The microphone is busy")
         }
+        // The phone's own noise filter takes the edge off fans, traffic and TV before we measure anything.
+        val ns = if (NoiseSuppressor.isAvailable()) runCatching {
+            NoiseSuppressor.create(recorder.audioSessionId)?.apply { enabled = true }
+        }.getOrNull() else null
 
         val pcm = ByteArrayOutputStream()
         val buf = ShortArray(CHUNK)
         val bytes = ByteBuffer.allocate(CHUNK * 2).order(ByteOrder.LITTLE_ENDIAN)
         var noise = 0.0
         var noiseChunks = 0
-        var threshold = 700.0
+        var threshold = 900.0
         var speechStarted = false
+        var speechChunks = 0
+        var peak = 0.0
         val start = System.currentTimeMillis()
         var lastSpeech = start
         if (alreadySaid != null) {
             // You're mid-sentence: skip measuring room noise, which would mistake your voice for it.
             pcm.write(alreadySaid)
             speechStarted = true
+            speechChunks = MIN_SPEECH_CHUNKS
             noiseChunks = CALIBRATION_CHUNKS
-            threshold = 900.0
+            noise = 300.0
         }
 
         recorder.startRecording()
@@ -87,21 +100,38 @@ class VoiceRecorder {
                     noise += rms
                     noiseChunks++
                     if (noiseChunks == CALIBRATION_CHUNKS) {
-                        threshold = (noise / CALIBRATION_CHUNKS * 2.5).coerceIn(600.0, 2000.0)
+                        noise /= CALIBRATION_CHUNKS
+                        threshold = thresholdFor(noise)
                     }
                     continue
                 }
-                if (rms > threshold) { speechStarted = true; lastSpeech = now }
+                if (rms > threshold) {
+                    speechStarted = true; speechChunks++; lastSpeech = now
+                } else if (!speechStarted && rms < noise * 1.5) {
+                    // Follow the room (a fan speeding up, traffic dying down), but only sounds close to its level:
+                    // your quieter first words must never count as noise, or the bar climbs past your voice.
+                    noise = noise * (if (rms < noise) 0.8 else 0.97) + rms * (if (rms < noise) 0.2 else 0.03)
+                    threshold = thresholdFor(noise)
+                }
+                if (rms > peak) peak = rms
 
                 val elapsed = now - start
                 if (!speechStarted && elapsed > waitForSpeechMs) break
-                if (speechStarted && now - lastSpeech > END_SILENCE_MS) break
+                if (speechStarted && now - lastSpeech > END_SILENCE_MS) {
+                    if (speechChunks >= MIN_SPEECH_CHUNKS) break
+                    // Only a short bump of noise: keep waiting for real words.
+                    speechStarted = false
+                    speechChunks = 0
+                }
                 if (elapsed > MAX_MS) break
             }
         } finally {
             onLevel(0f)
             runCatching { recorder.stop() }
             recorder.release()
+            ns?.release()
+            Log.i("MissMinutes", "Recording: noise=${noise.toInt()} threshold=${threshold.toInt()} " +
+                "peak=${peak.toInt()} speech=${speechChunks * 50}ms heard=$speechStarted")
         }
         if (!speechStarted || cancelled) return null
         return toWav(pcm.toByteArray())

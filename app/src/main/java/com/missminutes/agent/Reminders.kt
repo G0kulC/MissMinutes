@@ -251,8 +251,28 @@ object Announcer {
     }
 }
 
+/** Turns Do Not Disturb off again after "DND for an hour". */
+object DndTimer {
+    private fun pending(context: Context) = PendingIntent.getBroadcast(
+        context, 7_100, Intent(context, ReminderReceiver::class.java).setAction(ReminderReceiver.ACTION_DND_OFF),
+        PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+    )
+
+    fun offAt(context: Context, at: Long) {
+        val am = context.getSystemService(AlarmManager::class.java)
+        if (Build.VERSION.SDK_INT < 31 || am.canScheduleExactAlarms()) {
+            am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pending(context))
+        } else {
+            am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, at, pending(context))
+        }
+    }
+
+    fun cancel(context: Context) = context.getSystemService(AlarmManager::class.java).cancel(pending(context))
+}
+
 class ReminderReceiver : BroadcastReceiver() {
     companion object {
+        const val ACTION_DND_OFF = "com.missminutes.agent.DND_OFF"
         const val ACTION_FIRE = "com.missminutes.agent.REMINDER"
         const val ACTION_SNOOZE = "com.missminutes.agent.SNOOZE"
         const val ACTION_DONE = "com.missminutes.agent.DONE"
@@ -262,6 +282,10 @@ class ReminderReceiver : BroadcastReceiver() {
         val prefs = Prefs(context)
         when (intent.action) {
             ACTION_FIRE -> Reminders.fire(context, prefs, intent.getIntExtra("id", -1))
+            ACTION_DND_OFF -> runCatching {
+                context.getSystemService(NotificationManager::class.java)
+                    .setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL)
+            }
             ACTION_SNOOZE, ACTION_DONE -> {
                 context.getSystemService(NotificationManager::class.java).cancel(intent.getIntExtra("id", -1))
                 val text = intent.getStringExtra("text")

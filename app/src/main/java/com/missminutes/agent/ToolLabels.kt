@@ -30,7 +30,31 @@ object ToolLabels {
             "type_text" -> "Typing"
             "scroll" -> "Scrolling ${s("direction")}"
             "flashlight" -> if (input.optBoolean("on")) "Flashlight on" else "Flashlight off"
-            "set_volume" -> "Volume ${input.optInt("percent")}%"
+            "set_volume" -> when (s("change")) {
+                "up" -> "Volume up"
+                "down" -> "Volume down"
+                "mute" -> "Muting"
+                "unmute" -> "Unmuting"
+                else -> "Volume ${input.optInt("percent")}%"
+            }
+            "set_brightness" -> when {
+                s("change") == "up" -> "Brighter"
+                s("change") == "down" -> "Dimmer"
+                input.has("percent") -> "Brightness ${input.optInt("percent")}%"
+                else -> if (input.optBoolean("auto")) "Auto brightness" else "Brightness"
+            }
+            "sound_mode" -> when (s("mode")) {
+                "normal" -> "Ringer on"
+                "vibrate" -> "Vibrate mode"
+                "silent" -> "Silent mode"
+                "dnd_on" -> "Do Not Disturb on"
+                else -> "Do Not Disturb off"
+            }
+            "directions" -> if (input.optBoolean("start")) "Navigating to ${s("destination")}" else "Route to ${s("destination")}"
+            "read_calendar" -> "Checking your calendar"
+            "add_calendar_event" -> "Adding ${s("title")}"
+            "save_routine" -> "Saving routine ${s("name")}"
+            "delete_routine" -> "Deleting routine ${s("name")}"
             "media_control" -> "Music: ${s("action").replace('_', ' ')}"
             "phone_status" -> "Checking the phone"
             "remember" -> "Remembering"
@@ -40,6 +64,7 @@ object ToolLabels {
             "cancel_reminder" -> "Cancelling reminder"
             "watch_notifications" -> if (s("from").isNotEmpty()) "Watching for ${s("from")}" else "Watching notifications"
             "stop_watching" -> "Stopping alerts"
+            "think_deeper" -> "Thinking it through"
             "web_search" -> if (s("query").isNotEmpty()) "Searching: ${s("query")}" else "Searching the web"
             else -> name.replace('_', ' ')
         }

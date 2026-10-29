@@ -5,6 +5,7 @@ import android.security.keystore.KeyGenParameterSpec
 import android.security.keystore.KeyProperties
 import android.util.Base64
 import org.json.JSONArray
+import org.json.JSONObject
 import java.security.KeyStore
 import javax.crypto.Cipher
 import javax.crypto.KeyGenerator
@@ -37,6 +38,20 @@ class Prefs(context: Context) {
     var sarvamSpeaker: String
         get() = str("sarvam_speaker", Voices.default).takeIf { it in Voices.sarvam } ?: Voices.default
         set(v) = putStr("sarvam_speaker", v)
+    /** Who speaks for her: [SARVAM] or [ELEVENLABS]. She always hears you with Sarvam. */
+    var voiceProvider: String
+        get() = str("voice_provider", SARVAM).takeIf { it == ELEVENLABS } ?: SARVAM
+        set(v) = putStr("voice_provider", v)
+    var elevenKey: String get() = secret("eleven_key"); set(v) = putSecret("eleven_key", v)
+    var elevenVoice: String
+        get() = str("eleven_voice", ElevenVoices.default.id).takeIf { id -> ElevenVoices.all.any { it.id == id } }
+            ?: ElevenVoices.default.id
+        set(v) = putStr("eleven_voice", v)
+    var elevenModel: String
+        get() = str("eleven_model", ElevenModel.TURBO.id).takeIf { ElevenModel.byId(it) != null } ?: ElevenModel.TURBO.id
+        set(v) = putStr("eleven_model", v)
+    /** Live mode: real-time ElevenLabs conversations instead of listen, then think, then speak. */
+    var liveMode: Boolean get() = bool("live_mode", false); set(v) = putBool("live_mode", v)
     var countryCode: String get() = str("country_code", "91"); set(v) = putStr("country_code", v)
 
     var confirmBeforeSending: Boolean get() = bool("confirm", true); set(v) = putBool("confirm", v)
@@ -70,9 +85,31 @@ class Prefs(context: Context) {
         }.getOrDefault(emptyList())
         set(v) = putStr("memories", JSONArray(v.takeLast(60)).toString())
 
+    /** Routines: one phrase ("good night") runs several steps, written in plain words for Claude to carry out. */
+    var routines: Map<String, String>
+        get() = runCatching {
+            val o = JSONObject(str("routines", DEFAULT_ROUTINES))
+            o.keys().asSequence().associateWith { o.getString(it) }
+        }.getOrDefault(emptyMap())
+        set(v) = putStr("routines", JSONObject(v).toString())
+
     /** Pending reminders and notification watches, as JSON arrays (see Reminders.kt). */
     var remindersJson: String get() = str("reminders", "[]"); set(v) = putStr("reminders", v)
     var watchesJson: String get() = str("watches", "[]"); set(v) = putStr("watches", v)
+
+    companion object {
+        const val SARVAM = "sarvam"
+        const val ELEVENLABS = "elevenlabs"
+
+        /** Ready-made routines; the user can change or delete them by voice or in the app. */
+        private val DEFAULT_ROUTINES: String = JSONObject(mapOf(
+            "good night" to "Turn on Do Not Disturb until 6 AM, set brightness to 10 percent, set media volume to 20 percent, " +
+                "mention tomorrow's first calendar event if there is one, and wish me good night.",
+            "good morning" to "Turn Do Not Disturb off, turn auto brightness on, then tell me today's weather and today's " +
+                "calendar events in two or three short sentences.",
+            "i'm driving" to "Set media volume to 80 percent and ask me where I'm going, then start navigation there.",
+        )).toString()
+    }
 
     /** v1 stored keys as plain text; move them into encrypted storage. */
     private fun migrateFromV1() {

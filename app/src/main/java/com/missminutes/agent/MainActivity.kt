@@ -78,6 +78,8 @@ class MainActivity : Activity() {
     private lateinit var permsBox: LinearLayout
     private lateinit var claudeKey: EditText
     private lateinit var sarvamKey: EditText
+    private lateinit var elevenKey: EditText
+    private lateinit var voiceBox: LinearLayout
     private lateinit var country: EditText
     private var welcome: View? = null
     private var testPlayer: VoicePlayer? = null
@@ -88,6 +90,8 @@ class MainActivity : Activity() {
             add(Manifest.permission.READ_CONTACTS)
             add(Manifest.permission.CALL_PHONE)
             add(Manifest.permission.SEND_SMS)
+            add(Manifest.permission.READ_CALENDAR)
+            add(Manifest.permission.WRITE_CALENDAR)
             if (Build.VERSION.SDK_INT >= 33) add(Manifest.permission.POST_NOTIFICATIONS)
         }.toTypedArray()
 
@@ -520,10 +524,64 @@ class MainActivity : Activity() {
 
     private fun buildVoice() {
         val card = card()
-        header(card, "Voice", "The Sarvam voice she speaks Tamil and English with.")
-        val voices = Voices.sarvam
-        val spinner = Spinner(this).apply {
-            adapter = object : ArrayAdapter<String>(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, voices) {
+        header(card, "Voice", "Who she speaks Tamil and English with. She always hears you with Sarvam.")
+        voiceBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+        card.addView(voiceBox, full())
+        refreshVoice()
+    }
+
+    private fun refreshVoice() {
+        voiceBox.removeAllViews()
+        val eleven = prefs.voiceProvider == Prefs.ELEVENLABS
+        fun row(h: Int = 52, top: Int = 6) =
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dpi(h)).apply { topMargin = dpi(top) }
+
+        voiceBox.addView(label("Voice service"), full(top = 12))
+        val providers = listOf(Prefs.SARVAM, Prefs.ELEVENLABS)
+        voiceBox.addView(picker(listOf("Sarvam: made for Tamil", "ElevenLabs: most natural"), providers.indexOf(prefs.voiceProvider)) { i ->
+            if (providers[i] != prefs.voiceProvider) {
+                prefs.voiceProvider = providers[i]
+                reloadService()
+                voiceBox.post { refreshVoice() }
+            }
+        }, row())
+
+        if (eleven) {
+            val models = ElevenModel.entries
+            voiceBox.addView(label("Model"), full(top = 14))
+            voiceBox.addView(picker(models.map { it.title }, models.indexOfFirst { it.id == prefs.elevenModel }) { i ->
+                if (models[i].id != prefs.elevenModel) { prefs.elevenModel = models[i].id; reloadService() }
+            }, row())
+        }
+
+        voiceBox.addView(label("Voice"), full(top = 14))
+        val spinner = if (eleven) {
+            val voices = ElevenVoices.all
+            picker(voices.map { it.title }, voices.indexOfFirst { it.id == prefs.elevenVoice }) { i ->
+                if (voices[i].id != prefs.elevenVoice) { prefs.elevenVoice = voices[i].id; reloadService() }
+            }
+        } else {
+            val voices = Voices.sarvam
+            picker(voices, voices.indexOf(prefs.sarvamSpeaker)) { i ->
+                if (voices[i] != prefs.sarvamSpeaker) { prefs.sarvamSpeaker = voices[i]; reloadService() }
+            }
+        }
+        voiceBox.addView(LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            addView(spinner, LinearLayout.LayoutParams(0, dpi(52), 1f))
+            addView(button("Test voice", ButtonStyle.OUTLINE) { testVoice() },
+                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dpi(52)).apply { marginStart = dpi(10) })
+        }, full(top = 6))
+        val hint = if (eleven) "Add your ElevenLabs key under Keys. If ElevenLabs fails, she uses the Sarvam voice."
+                   else "Names with a style, like shalini_en_companion, use Sarvam's faster model."
+        voiceBox.addView(text(hint, 13f, Fonts.REGULAR, Palette.MUTED), full(top = 10))
+    }
+
+    /** A dropdown in the app's style; [onPick] also runs once when it first appears, with the current choice. */
+    private fun picker(items: List<String>, selected: Int, onPick: (Int) -> Unit): Spinner {
+        return Spinner(this).apply {
+            adapter = object : ArrayAdapter<String>(this@MainActivity, android.R.layout.simple_spinner_dropdown_item, items) {
                 override fun getView(position: Int, convertView: View?, parent: ViewGroup) =
                     style(super.getView(position, convertView, parent) as TextView)
                 override fun getDropDownView(position: Int, convertView: View?, parent: ViewGroup) =
@@ -537,23 +595,12 @@ class MainActivity : Activity() {
             }
             background = surface(radius = 14f, color = Palette.SURFACE_HI)
             setPopupBackgroundDrawable(surface(radius = 16f, color = Palette.SURFACE_HI))
-            setSelection(voices.indexOf(prefs.sarvamSpeaker).coerceAtLeast(0))
+            setSelection(selected.coerceAtLeast(0))
             onItemSelectedListener = object : AdapterView.OnItemSelectedListener {
-                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) {
-                    prefs.sarvamSpeaker = voices[position]
-                }
+                override fun onItemSelected(parent: AdapterView<*>?, view: View?, position: Int, id: Long) = onPick(position)
                 override fun onNothingSelected(parent: AdapterView<*>?) {}
             }
         }
-        card.addView(LinearLayout(this).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(spinner, LinearLayout.LayoutParams(0, dpi(52), 1f))
-            addView(button("Test voice", ButtonStyle.OUTLINE) { testVoice() },
-                LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, dpi(52)).apply { marginStart = dpi(10) })
-        }, full(top = 12))
-        card.addView(text("Names with a style, like shalini_en_companion, use Sarvam's faster model.",
-            13f, Fonts.REGULAR, Palette.MUTED), full(top = 10))
     }
 
     // ---------- Behaviour ----------
@@ -561,6 +608,9 @@ class MainActivity : Activity() {
     private fun buildBehaviour() {
         val card = card()
         header(card, "Behaviour", null)
+        card.addView(toggle("Live mode (ElevenLabs)",
+            "Real-time conversation: she hears you as you talk and answers in about a second. Uses ElevenLabs minutes and your ElevenLabs key.",
+            prefs.liveMode) { prefs.liveMode = it })
         card.addView(toggle("Ask before sending", "She reads a message or call back and waits for your yes.",
             prefs.confirmBeforeSending) { prefs.confirmBeforeSending = it })
         card.addView(toggle("Quick replies", "Simple commands like calls, alarms or the flashlight use Claude Haiku 5.5 for an instant answer.",
@@ -611,16 +661,23 @@ class MainActivity : Activity() {
 
     private fun buildMemory() {
         val card = card()
-        header(card, "Memory", "Things she remembers about you. Say “remember that…” to add more.")
+        header(card, "Memory and routines",
+            "Things she remembers about you, and phrases that run several steps. Say “remember that…” or “make a routine…” to add more.")
         memoryBox = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
         card.addView(memoryBox, full(top = 8))
     }
 
     private fun refreshMemory() {
         memoryBox.removeAllViews()
+        prefs.routines.forEach { (name, steps) ->
+            memoryBox.addView(listRow("“${name.replaceFirstChar(Char::uppercase)}”", steps, "Remove") {
+                prefs.routines = prefs.routines - name
+                refreshMemory()
+            })
+        }
         val items = prefs.memories
         if (items.isEmpty()) {
-            memoryBox.addView(empty("Nothing yet."))
+            if (prefs.routines.isEmpty()) memoryBox.addView(empty("Nothing yet."))
             return
         }
         items.forEach { fact ->
@@ -646,6 +703,9 @@ class MainActivity : Activity() {
         keysCard.addView(label("Sarvam API key"), full(top = 14))
         sarvamKey = input(prefs.sarvamKey, "sk_…", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
         keysCard.addView(sarvamKey, full(top = 6))
+        keysCard.addView(label("ElevenLabs API key (optional)"), full(top = 14))
+        elevenKey = input(prefs.elevenKey, "sk_…", InputType.TYPE_CLASS_TEXT or InputType.TYPE_TEXT_VARIATION_PASSWORD)
+        keysCard.addView(elevenKey, full(top = 6))
         keysCard.addView(label("Country code for phone numbers"), full(top = 14))
         country = input(prefs.countryCode, "91", InputType.TYPE_CLASS_PHONE)
         keysCard.addView(country, full(top = 6))
@@ -678,6 +738,8 @@ class MainActivity : Activity() {
             PermissionRow("Contacts", "To find who to message or call", has(Manifest.permission.READ_CONTACTS), askRuntime),
             PermissionRow("Phone calls", "To call people for you", has(Manifest.permission.CALL_PHONE), askRuntime),
             PermissionRow("SMS", "To send text messages", has(Manifest.permission.SEND_SMS), askRuntime),
+            PermissionRow("Calendar", "To read your day and add events",
+                has(Manifest.permission.READ_CALENDAR) && has(Manifest.permission.WRITE_CALENDAR), askRuntime),
             PermissionRow("Notifications", "For reminders and her status",
                 Build.VERSION.SDK_INT < 33 || has(Manifest.permission.POST_NOTIFICATIONS), askRuntime),
             PermissionRow("Display over other apps", "Her orb at the bottom of the screen", Settings.canDrawOverlays(this)) {
@@ -688,6 +750,13 @@ class MainActivity : Activity() {
             },
             PermissionRow("Notification access", "To read messages, reply and alert you", notificationAccessOn()) {
                 startActivity(Intent(Settings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+            },
+            PermissionRow("Do Not Disturb access", "To switch silent, vibrate and Do Not Disturb",
+                getSystemService(NotificationManager::class.java).isNotificationPolicyAccessGranted) {
+                startActivity(Intent(Settings.ACTION_NOTIFICATION_POLICY_ACCESS_SETTINGS))
+            },
+            PermissionRow("Change brightness", "To make the screen brighter or dimmer", Settings.System.canWrite(this)) {
+                startActivity(Intent(Settings.ACTION_MANAGE_WRITE_SETTINGS, Uri.parse("package:$packageName")))
             },
             PermissionRow("Run in the background", "So she can hear the wake word", batteryUnrestricted()) {
                 startActivity(Intent(Settings.ACTION_REQUEST_IGNORE_BATTERY_OPTIMIZATIONS, Uri.parse("package:$packageName")))
@@ -753,6 +822,7 @@ class MainActivity : Activity() {
     private fun saveKeys() {
         prefs.claudeKey = claudeKey.text.toString()
         prefs.sarvamKey = sarvamKey.text.toString()
+        prefs.elevenKey = elevenKey.text.toString()
         prefs.countryCode = country.text.toString().filter { it.isDigit() }.ifBlank { "91" }
     }
 
@@ -762,7 +832,7 @@ class MainActivity : Activity() {
         saveKeys()
         scope.launch {
             try {
-                val player = testPlayer ?: VoicePlayer(this@MainActivity, SarvamClient(prefs)).also { testPlayer = it }
+                val player = testPlayer ?: VoicePlayer(this@MainActivity, VoiceSwitch(prefs, SarvamClient(prefs), ElevenLabsClient(prefs))).also { testPlayer = it }
                 dial.state = OrbState.SPEAKING
                 player.onLevel = { dial.setLevel(it) }
                 dial.start(withIntro = false)

@@ -21,7 +21,15 @@ import org.json.JSONObject
 import java.text.SimpleDateFormat
 import java.util.Date
 import java.util.Locale
+import android.provider.Settings
+import android.app.NotificationManager
+import android.content.ContentUris
+import android.content.ContentValues
+import android.provider.CalendarContract
+import java.util.TimeZone
+import kotlin.math.pow
 import kotlin.math.roundToInt
+import kotlin.math.sqrt
 
 /** Everything Miss Minutes can do on the phone. To add a power: add a case here and a tool in ClaudeBrain. */
 class PhoneActions(private val context: Context, private val prefs: Prefs) {
@@ -45,7 +53,14 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         "type_text" -> screen()?.typeText(input.text("text"), input.optBoolean("press_enter", false)) ?: ACCESSIBILITY_OFF
         "scroll" -> screen()?.scroll(input.text("direction")) ?: ACCESSIBILITY_OFF
         "flashlight" -> flashlight(input.optBoolean("on", true))
-        "set_volume" -> setVolume(input.getInt("percent"))
+        "set_volume" -> setVolume(input)
+        "set_brightness" -> setBrightness(input)
+        "sound_mode" -> soundMode(input.text("mode"), input.optInt("minutes", 0))
+        "directions" -> directions(input.text("destination"), input.text("mode"), input.optBoolean("start", false))
+        "read_calendar" -> readCalendar(input.text("date"), input.optInt("days", 1))
+        "add_calendar_event" -> addCalendarEvent(input)
+        "save_routine" -> saveRoutine(input.text("name"), input.text("steps"))
+        "delete_routine" -> deleteRoutine(input.text("name"))
         "media_control" -> mediaControl(input.text("action"))
         "phone_status" -> phoneStatus()
         "remember" -> remember(input.text("fact"))
@@ -270,12 +285,66 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         return if (on) "Flashlight on." else "Flashlight off."
     }
 
-    private fun setVolume(percent: Int): String {
-        val p = percent.coerceIn(0, 100)
+    /** An exact level, or a step up or down, or mute, for media, ringtone, notifications, alarms or calls. */
+    private fun setVolume(input: JSONObject): String {
+        val (stream, label) = when (input.text("stream")) {
+            "ring" -> AudioManager.STREAM_RING to "Ringtone"
+            "notification" -> AudioManager.STREAM_NOTIFICATION to "Notification"
+            "alarm" -> AudioManager.STREAM_ALARM to "Alarm"
+            "call" -> AudioManager.STREAM_VOICE_CALL to "Call"
+            else -> AudioManager.STREAM_MUSIC to "Media"
+        }
         val am = context.getSystemService(AudioManager::class.java)
-        val max = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)
-        am.setStreamVolume(AudioManager.STREAM_MUSIC, (max * p / 100.0).roundToInt(), AudioManager.FLAG_SHOW_UI)
-        return "Media volume set to $p%."
+        val max = am.getStreamMaxVolume(stream)
+        val step = (max * 0.15).roundToInt().coerceAtLeast(1)
+        val flags = AudioManager.FLAG_SHOW_UI
+        try {
+            when (input.text("change")) {
+                "mute" -> am.adjustStreamVolume(stream, AudioManager.ADJUST_MUTE, flags)
+                "unmute" -> am.adjustStreamVolume(stream, AudioManager.ADJUST_UNMUTE, flags)
+                "up" -> am.setStreamVolume(stream, (am.getStreamVolume(stream) + step).coerceAtMost(max), flags)
+                "down" -> am.setStreamVolume(stream, (am.getStreamVolume(stream) - step).coerceAtLeast(0), flags)
+                else -> {
+                    if (!input.has("percent")) return "ERROR: give percent, or change up, down, mute or unmute"
+                    val p = input.optInt("percent").coerceIn(0, 100)
+                    am.setStreamVolume(stream, (max * p / 100.0).roundToInt(), flags)
+                }
+            }
+        } catch (e: SecurityException) {
+            // Android blocks ringtone and notification changes that would switch Do Not Disturb on or off.
+            return "ERROR: Do Not Disturb is on, so Android won't let me change the $label volume. The user can turn it off first."
+        }
+        if (am.isStreamMute(stream)) return "$label volume muted."
+        return "$label volume is now ${(am.getStreamVolume(stream) * 100.0 / max).roundToInt()}%."
+    }
+
+    /** An exact level, a step up or down, or auto brightness on or off. Needs "Modify system settings". */
+    private fun setBrightness(input: JSONObject): String {
+        if (!Settings.System.canWrite(context)) return BRIGHTNESS_OFF
+        val cr = context.contentResolver
+        val mode = Settings.System.SCREEN_BRIGHTNESS_MODE
+        val change = input.text("change")
+        if (input.has("auto") && !input.isNull("auto")) {
+            val auto = input.optBoolean("auto")
+            Settings.System.putInt(cr, mode,
+                if (auto) Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC else Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+            if (auto || (change.isEmpty() && !input.has("percent"))) {
+                return if (auto) "Auto brightness on." else "Auto brightness off."
+            }
+        }
+        // The brightness slider isn't linear: half way on it is about a quarter of the raw 0-255 value.
+        val raw = Settings.System.getInt(cr, Settings.System.SCREEN_BRIGHTNESS, 128)
+        val current = sqrt(raw.coerceIn(0, 255) / 255.0) * 100
+        val target = when (change) {
+            "up" -> current + 20
+            "down" -> current - 20
+            else -> if (input.has("percent")) input.optInt("percent").toDouble()
+                    else return "ERROR: give percent, change up or down, or auto"
+        }.coerceIn(1.0, 100.0)
+        val wasAuto = Settings.System.getInt(cr, mode, 0) == Settings.System.SCREEN_BRIGHTNESS_MODE_AUTOMATIC
+        Settings.System.putInt(cr, mode, Settings.System.SCREEN_BRIGHTNESS_MODE_MANUAL)
+        Settings.System.putInt(cr, Settings.System.SCREEN_BRIGHTNESS, (255 * (target / 100).pow(2)).roundToInt().coerceIn(1, 255))
+        return "Brightness set to ${target.roundToInt()}%." + if (wasAuto) " Auto brightness is now off." else ""
     }
 
     private fun mediaControl(action: String): String {
@@ -291,6 +360,166 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, code))
         am.dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, code))
         return "Done."
+    }
+
+    /** Ring, vibrate, silent, and Do Not Disturb (optionally for a while). Needs "Do Not Disturb access". */
+    private fun soundMode(mode: String, minutes: Int): String {
+        val nm = context.getSystemService(NotificationManager::class.java)
+        val am = context.getSystemService(AudioManager::class.java)
+        if (mode != "vibrate" && !nm.isNotificationPolicyAccessGranted) return DND_OFF
+        try {
+            when (mode) {
+                "normal" -> am.ringerMode = AudioManager.RINGER_MODE_NORMAL
+                "vibrate" -> am.ringerMode = AudioManager.RINGER_MODE_VIBRATE
+                "silent" -> am.ringerMode = AudioManager.RINGER_MODE_SILENT
+                // Priority only: starred contacts and alarms still get through.
+                "dnd_on" -> nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_PRIORITY)
+                "dnd_off" -> { nm.setInterruptionFilter(NotificationManager.INTERRUPTION_FILTER_ALL); DndTimer.cancel(context) }
+                else -> return "ERROR: mode must be normal, vibrate, silent, dnd_on or dnd_off"
+            }
+        } catch (e: SecurityException) {
+            return DND_OFF
+        }
+        return when (mode) {
+            "normal" -> "Ringer on."
+            "vibrate" -> "Phone on vibrate."
+            "silent" -> "Phone on silent."
+            "dnd_off" -> "Do Not Disturb off."
+            else -> if (minutes > 0) {
+                val until = System.currentTimeMillis() + minutes * 60_000L
+                DndTimer.offAt(context, until)
+                "Do Not Disturb on until ${Reminders.describe(until)}. Starred contacts and alarms still come through."
+            } else {
+                DndTimer.cancel(context)
+                "Do Not Disturb on. Starred contacts and alarms still come through."
+            }
+        }
+    }
+
+    // ---------- Maps ----------
+
+    /** Directions in Google Maps, or straight into turn-by-turn navigation with [go]. */
+    private fun directions(destination: String, mode: String, go: Boolean): String {
+        if (destination.isBlank()) return "ERROR: where to?"
+        val maps = "com.google.android.apps.maps"
+        val hasMaps = installed(maps)
+        val navigate = go && hasMaps && mode != "transit"
+        val uri = if (navigate) {
+            val m = when (mode) { "walk" -> "w"; "bike" -> "b"; "two_wheeler" -> "l"; else -> "d" }
+            Uri.parse("google.navigation:q=${Uri.encode(destination)}&mode=$m")
+        } else {
+            val m = when (mode) { "walk" -> "walking"; "bike", "two_wheeler" -> "bicycling"; "transit" -> "transit"; else -> "driving" }
+            Uri.parse("https://www.google.com/maps/dir/?api=1&destination=${Uri.encode(destination)}&travelmode=$m")
+        }
+        start(Intent(Intent.ACTION_VIEW, uri).apply { if (hasMaps) setPackage(maps) })
+        return if (navigate) "Started navigation to $destination."
+        else "Showing directions to $destination. To tell the user the travel time, use read_screen."
+    }
+
+    // ---------- Calendar ----------
+
+    private fun parseDay(date: String): java.util.Calendar? {
+        val cal = java.util.Calendar.getInstance()
+        if (date.isNotEmpty()) {
+            cal.time = runCatching { SimpleDateFormat("yyyy-MM-dd", Locale.ENGLISH).parse(date) }.getOrNull() ?: return null
+        }
+        cal.set(java.util.Calendar.HOUR_OF_DAY, 0)
+        cal.set(java.util.Calendar.MINUTE, 0)
+        cal.set(java.util.Calendar.SECOND, 0)
+        cal.set(java.util.Calendar.MILLISECOND, 0)
+        return cal
+    }
+
+    private fun readCalendar(date: String, days: Int): String {
+        if (!granted(Manifest.permission.READ_CALENDAR)) return CALENDAR_OFF
+        val from = parseDay(date)?.timeInMillis ?: return "ERROR: date must be YYYY-MM-DD"
+        val to = from + days.coerceIn(1, 14) * 86_400_000L
+        val uri = CalendarContract.Instances.CONTENT_URI.buildUpon()
+            .also { ContentUris.appendId(it, from); ContentUris.appendId(it, to) }.build()
+        val cols = arrayOf(
+            CalendarContract.Instances.TITLE, CalendarContract.Instances.BEGIN,
+            CalendarContract.Instances.ALL_DAY, CalendarContract.Instances.EVENT_LOCATION,
+        )
+        val timed = SimpleDateFormat("EEE d MMM, h:mm a", Locale.ENGLISH)
+        // All-day events are stored at midnight UTC; reading them in local time can slip a day.
+        val allDay = SimpleDateFormat("EEE d MMM", Locale.ENGLISH).apply { timeZone = TimeZone.getTimeZone("UTC") }
+        val out = mutableListOf<String>()
+        context.contentResolver.query(
+            uri, cols, "${CalendarContract.Instances.VISIBLE} = 1", null, "${CalendarContract.Instances.BEGIN} ASC"
+        )?.use { c ->
+            while (c.moveToNext() && out.size < 25) {
+                val title = c.getString(0)?.takeIf { it.isNotBlank() } ?: "(no title)"
+                val begin = Date(c.getLong(1))
+                val whenText = if (c.getInt(2) == 1) allDay.format(begin) + ", all day" else timed.format(begin)
+                val place = c.getString(3)?.takeIf { it.isNotBlank() }?.let { " at $it" } ?: ""
+                out += "$whenText: $title$place"
+            }
+        }
+        return if (out.isEmpty()) "No events." else out.joinToString("\n")
+    }
+
+    private fun addCalendarEvent(input: JSONObject): String {
+        if (!granted(Manifest.permission.WRITE_CALENDAR) || !granted(Manifest.permission.READ_CALENDAR)) return CALENDAR_OFF
+        val title = input.text("title").ifEmpty { return "ERROR: what is the event called?" }
+        val day = parseDay(input.text("date")) ?: return "ERROR: date must be YYYY-MM-DD"
+        val time = input.text("time")
+        val calendarId = writableCalendar()
+            ?: return "ERROR: no calendar on this phone can take new events. The user needs a Google account in Calendar."
+        val values = ContentValues().apply {
+            put(CalendarContract.Events.CALENDAR_ID, calendarId)
+            put(CalendarContract.Events.TITLE, title)
+            input.text("location").takeIf { it.isNotEmpty() }?.let { put(CalendarContract.Events.EVENT_LOCATION, it) }
+        }
+        val start: Long
+        if (time.isEmpty()) {
+            // All-day events must start at midnight UTC.
+            val utc = java.util.Calendar.getInstance(TimeZone.getTimeZone("UTC")).apply {
+                clear()
+                set(day.get(java.util.Calendar.YEAR), day.get(java.util.Calendar.MONTH), day.get(java.util.Calendar.DAY_OF_MONTH))
+            }
+            start = utc.timeInMillis
+            values.put(CalendarContract.Events.ALL_DAY, 1)
+            values.put(CalendarContract.Events.DTSTART, start)
+            values.put(CalendarContract.Events.DTEND, start + 86_400_000L)
+            values.put(CalendarContract.Events.EVENT_TIMEZONE, "UTC")
+        } else {
+            val m = Regex("""^(\d{1,2}):(\d{2})$""").find(time) ?: return "ERROR: time must be HH:MM in 24-hour format"
+            day.set(java.util.Calendar.HOUR_OF_DAY, m.groupValues[1].toInt().coerceIn(0, 23))
+            day.set(java.util.Calendar.MINUTE, m.groupValues[2].toInt().coerceIn(0, 59))
+            start = day.timeInMillis
+            val minutes = input.optInt("duration_minutes", 60).coerceIn(5, 24 * 60)
+            values.put(CalendarContract.Events.DTSTART, start)
+            values.put(CalendarContract.Events.DTEND, start + minutes * 60_000L)
+            values.put(CalendarContract.Events.EVENT_TIMEZONE, TimeZone.getDefault().id)
+        }
+        val uri = context.contentResolver.insert(CalendarContract.Events.CONTENT_URI, values)
+            ?: return "ERROR: Calendar didn't accept the event"
+        if (time.isNotEmpty()) {
+            context.contentResolver.insert(CalendarContract.Reminders.CONTENT_URI, ContentValues().apply {
+                put(CalendarContract.Reminders.EVENT_ID, ContentUris.parseId(uri))
+                put(CalendarContract.Reminders.MINUTES, 10)
+                put(CalendarContract.Reminders.METHOD, CalendarContract.Reminders.METHOD_ALERT)
+            })
+        }
+        val whenText = if (time.isEmpty()) SimpleDateFormat("EEEE d MMMM", Locale.ENGLISH).format(day.time) + ", all day"
+                       else Reminders.describe(start)
+        return "Added \"$title\" to the calendar for $whenText."
+    }
+
+    /** The phone's main calendar that can take new events (the Google account's own one if there is one). */
+    private fun writableCalendar(): Long? {
+        val cols = arrayOf(CalendarContract.Calendars._ID, CalendarContract.Calendars.IS_PRIMARY, CalendarContract.Calendars.ACCOUNT_TYPE)
+        val where = "${CalendarContract.Calendars.CALENDAR_ACCESS_LEVEL} >= ${CalendarContract.Calendars.CAL_ACCESS_CONTRIBUTOR}" +
+            " AND ${CalendarContract.Calendars.VISIBLE} = 1"
+        var best: Long? = null
+        var bestScore = -1
+        context.contentResolver.query(CalendarContract.Calendars.CONTENT_URI, cols, where, null, null)?.use { c ->
+            while (c.moveToNext()) {
+                val score = (if (c.getInt(1) == 1) 2 else 0) + (if (c.getString(2) == "com.google") 1 else 0)
+                if (score > bestScore) { bestScore = score; best = c.getLong(0) }
+            }
+        }
+        return best
     }
 
     private fun phoneStatus(): String {
@@ -323,6 +552,23 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         prefs.memories = after
         val removed = before.size - after.size
         return if (removed > 0) "Forgot $removed thing(s)." else "Nothing in memory mentions \"$about\"."
+    }
+
+    // ---------- Routines ----------
+
+    private fun saveRoutine(name: String, steps: String): String {
+        val key = name.lowercase().trim().ifEmpty { return "ERROR: what should the routine be called?" }
+        if (steps.isBlank()) return "ERROR: what should the routine do?"
+        prefs.routines = prefs.routines + (key to steps)
+        return "Saved the \"$key\" routine."
+    }
+
+    private fun deleteRoutine(name: String): String {
+        val key = name.lowercase().trim()
+        val before = prefs.routines
+        if (key !in before) return "No routine called \"$key\". Routines: ${before.keys.joinToString()}."
+        prefs.routines = before - key
+        return "Deleted the \"$key\" routine."
     }
 
     // ---------- Reminders and notification watches ----------
@@ -398,6 +644,12 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
     companion object {
         private const val ACCESSIBILITY_OFF =
             "ERROR: Accessibility is off for Miss Minutes. The user can turn it on in the Miss Minutes app."
+        private const val DND_OFF =
+            "ERROR: Miss Minutes isn't allowed to change Do Not Disturb or silent mode yet. The user can turn on Do Not Disturb access in the Miss Minutes app."
+        private const val CALENDAR_OFF =
+            "ERROR: Calendar permission is off. The user can allow it in the Miss Minutes app."
+        private const val BRIGHTNESS_OFF =
+            "ERROR: Miss Minutes isn't allowed to change brightness yet. The user can turn on Change brightness in the Miss Minutes app."
         private const val NOTIFICATIONS_OFF =
             "ERROR: Notification access is off for Miss Minutes. The user can allow it in the Miss Minutes app."
     }

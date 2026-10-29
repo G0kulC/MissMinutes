@@ -56,11 +56,17 @@ class MissMinutesService : Service() {
         private const val CHANNEL = "miss_minutes"
         private const val NOTIF_ID = 7
         private const val TAG = "MissMinutes"
-        private const val FILLER_AFTER_MS = 1100L
+        // Claude usually starts answering within 2 s; a filler before that just makes every reply say "Let me check".
+        private const val FILLER_AFTER_MS = 2200L
         private const val MAX_ROUNDS = 6
         private val CONFIRM_PHRASES = listOf(
             "shall i", "should i", "can i", "do you want me to", "want me to", "is that ok", "is that okay",
             "send it?", "go ahead?", "confirm",
+        )
+        /** What speech-to-text makes of a cough or room noise; not a request. */
+        private val NOISE_WORDS = setOf(
+            "hmm", "hm", "mm", "mmm", "um", "umm", "uh", "ah", "oh", "ha", "huh",
+            "ம்", "ம்ம்", "ம்ம்ம்", "ஹ்ம்", "ஆ", "ஓ", "ஹா",
         )
 
         @Volatile var running = false
@@ -76,6 +82,7 @@ class MissMinutesService : Service() {
     private lateinit var player: VoicePlayer
     private lateinit var actions: PhoneActions
     private lateinit var brain: ClaudeBrain
+    private lateinit var live: LiveSession
     private val recorder = VoiceRecorder()
 
     private var wakeWord: WakeWord? = null
@@ -95,10 +102,16 @@ class MissMinutesService : Service() {
         super.onCreate()
         prefs = Prefs(this)
         sarvam = SarvamClient(prefs)
-        player = VoicePlayer(this, sarvam)
+        player = VoicePlayer(this, VoiceSwitch(prefs, sarvam, ElevenLabsClient(prefs)))
         actions = PhoneActions(this, prefs)
         brain = ClaudeBrain(prefs, actions)
         overlay = OverlayManager(this, prefs)
+        val main = android.os.Handler(android.os.Looper.getMainLooper())
+        live = LiveSession(this, prefs, actions, brain, object : LiveSession.Ui {
+            override fun state(s: OrbState) { main.post { overlay.setState(s) } }
+            override fun level(v: Float) { main.post { overlay.setLevel(v) } }
+            override fun activity(label: String) { main.post { overlay.setActivity(label) } }
+        })
 
         overlay.onTap = {
             when (overlay.state) {
@@ -257,6 +270,19 @@ class MissMinutesService : Service() {
         requestAudioFocus()
         delay(180)
         try {
+            // Reminders and alerts open with their own line, which Live mode can't say first, so they go the usual way.
+            if (typed == null && intro == null && prefs.liveMode) {
+                try {
+                    actions.quietAfterAction = false
+                    live.run()
+                    return
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    Log.w(TAG, "Live mode failed; using the usual way", e)
+                    overlay.setActivity("Live mode unavailable")
+                }
+            }
             var rounds = 0
             var waitMs = 6000L
             var alreadySaid: ByteArray? = null
@@ -282,7 +308,7 @@ class MissMinutesService : Service() {
                         sarvam.transcribe(it)
                     }
                 }
-                if (heard.isNullOrBlank()) break
+                if (heard.isNullOrBlank() || isNoise(heard)) break
 
                 overlay.hidePanel()
                 overlay.setState(OrbState.THINKING)
@@ -340,7 +366,8 @@ class MissMinutesService : Service() {
      * (The cache keeps only what's listed here, so both lists go together.)
      */
     private fun prefetchGreetings() {
-        if (prefs.sarvamKey.isBlank()) return
+        val key = if (prefs.voiceProvider == Prefs.ELEVENLABS) prefs.elevenKey else prefs.sarvamKey
+        if (key.isBlank()) return
         val lines = (if (prefs.greetOnWake) Greetings.all(prefs) else emptyList()) + Fillers.all()
         scope.launch { player.prefetch(lines) }
     }
@@ -374,6 +401,7 @@ class MissMinutesService : Service() {
             }
         }
         val filler = launch {
+            if (prefs.quickReplies && QuickRouter.isQuick(heard)) return@launch // Haiku answers fast enough
             delay(FILLER_AFTER_MS)
             val line = Fillers.pick(heard)
             if (!player.isCached(line)) return@launch
@@ -415,6 +443,13 @@ class MissMinutesService : Service() {
         listening?.await()
     }
 
+    /** Only punctuation or sounds like "hmm": speech-to-text heard noise, not words. */
+    private fun isNoise(text: String): Boolean {
+        val words = text.lowercase().replace(Regex("[^\\p{L}\\p{M}\\p{N}]+"), " ").trim()
+            .split(' ').filter { it.isNotEmpty() }
+        return words.isEmpty() || words.all { it in NOISE_WORDS }
+    }
+
     /** Her question asks you to approve something ("…அனுப்பட்டுமா?", "Shall I call Amma?"). */
     private fun isConfirmation(reply: String): Boolean {
         val q = reply.trim()
@@ -429,6 +464,7 @@ class MissMinutesService : Service() {
         e is ClaudeBrain.ClaudeException && e.code == 429 -> "Too many requests to Claude. Try again in a minute."
         e is ClaudeBrain.ClaudeException && e.code == 529 -> "Claude is busy right now. Try again shortly."
         e is SarvamClient.SarvamException && e.code in 401..403 -> "Your Sarvam API key isn't working. Check it in the app."
+        e is ElevenLabsClient.ElevenException && e.code in 401..403 -> "Your ElevenLabs API key isn't working. Check it in the app."
         e is UnknownHostException || e is SocketTimeoutException -> "I can't reach the internet right now."
         else -> "Something went wrong: ${e.message?.take(80) ?: "unknown error"}"
     }

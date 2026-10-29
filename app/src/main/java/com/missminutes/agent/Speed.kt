@@ -23,8 +23,8 @@ object QuickRouter {
         "flashlight", "torch", "light", "volume", "louder", "quieter", "mute", "pause", "play", "next", "previous",
         "song", "music", "alarm", "timer", "remind", "reminder", "call", "ring", "open", "home", "back", "lock",
         "battery", "time", "message", "whatsapp", "sms", "text", "send", "reply", "stop", "cancel", "remember", "forget",
-        "youtube", "notification", "messages",
-        "அனுப்பு", "போடு", "வை", "திற", "கால்", "நிறுத்து", "அலாரம்", "மெசேஜ்",
+        "youtube", "notification", "messages", "brightness", "brighter", "dim", "sound", "silent", "ringtone",
+        "அனுப்பு", "போடு", "வை", "திற", "கால்", "நிறுத்து", "அலாரம்", "மெசேஜ்", "வெளிச்சம்", "சத்தம்", "வால்யூம்",
         "anuppu", "podu", "vai", "thira", "pannu", "niruthu",
     )
 

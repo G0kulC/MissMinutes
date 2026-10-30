@@ -8,6 +8,7 @@ import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.withTimeoutOrNull
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -23,7 +24,7 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 
 /**
- * Miss Minutes' brain. Sends what you said to Claude with the phone tools, runs the tools
+ * The assistant's brain. Sends what you said to Claude with the phone tools, runs the tools
  * Claude picks (several in a row for multi-step tasks), and returns what she should say.
  */
 class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
@@ -32,11 +33,26 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         fun onToolStart(id: String, name: String, input: JSONObject)
         fun onToolEnd(id: String, ok: Boolean)
         fun onModelSwitched(model: BrainModel)
+        /** The mood tag of the reply she's about to speak ("happy", "sad", "calm"…). */
+        fun onMood(mood: String) {}
+        /** One of the user's agents took over the conversation, or (null) the main assistant is back. */
+        fun onAgentChanged(agent: Agent?) {}
     }
 
     class ClaudeException(val code: Int, val type: String, message: String) : IOException(message)
 
     var listener: Listener? = null
+
+    /**
+     * The user's agent talking right now, or null for the main assistant. Its own prompt, abilities and voice
+     * apply from the next turn after a switch (a turn's instructions can't change part-way through).
+     */
+    var agent: Agent? = null
+        set(value) {
+            if (field?.id == value?.id) return
+            field = value
+            listener?.onAgentChanged(value)
+        }
 
     private val http = OkHttpClient.Builder()
         .connectTimeout(15, TimeUnit.SECONDS)
@@ -54,35 +70,52 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
      * thread). Everything she should say comes through it, so the caller doesn't speak the returned text again.
      */
     suspend fun handle(
-        spoken: String, context: String? = null, deep: Boolean = false, onSentence: (String) -> Unit = {}
+        spoken: String, context: String? = null, onSentence: (String) -> Unit = {}
     ): String {
-        val userText = if (context == null) spoken else "(Miss Minutes just told me: \"$context\") $spoken"
+        val userText = if (context == null) spoken else "(${speakerName()} just told me: \"$context\") $spoken"
         val now = System.currentTimeMillis()
         if (now - lastTurn > 3 * 60_000) history.clear() // fresh conversation after 3 quiet minutes
         lastTurn = now
 
         val messages = JSONArray()
         history.forEach { messages.put(it) }
-        messages.put(textMessage("user", userText))
+        val photo = if (PicoCamera.open) withTimeoutOrNull(2000) { runCatching { PicoCamera.frame?.invoke() }.getOrNull() } else null
+        messages.put(if (photo == null) textMessage("user", userText) else JSONObject().put("role", "user").put("content", JSONArray()
+            .put(imageBlock(photo))
+            .put(JSONObject().put("type", "text").put("text", "(The photo is what my ${PicoCamera.facing} camera sees right now.) $userText"))))
         // Built once per turn: Claude's thinking blocks are only valid while everything before them, including
         // the system prompt, stays byte-for-byte the same. Rebuilding it each round (the clock ticking over,
         // a new memory) made the API reject the turn with "Invalid signature in thinking block".
+        turnAgent = agent
+        turnText = spoken
+        turnQuick = prefs.quickReplies && QuickRouter.isQuick(spoken)
         val system = systemPrompt()
-        val model = pickModel(spoken, deep)
-        Log.i("MissMinutes", "Model for this turn: $model")
+        val model = pickModel(spoken)
+        PicoLog.i("Model for this turn: $model")
 
         val said = StringBuilder()
-        val splitter = SentenceSplitter { sentence ->
+        val splitter = SentenceSplitter(earlyStart = prefs.picoLive, name = prefs.userName.trim()) { sentence ->
             val clean = speakable(sentence)
             if (clean.isNotEmpty()) {
-                said.append(clean).append(' ')
+                // A part that's only punctuation (a name taken out) joins the words before it.
+                if (clean.none { it.isLetterOrDigit() }) {
+                    while (said.isNotEmpty() && (said.last() == ' ' || said.last() == ',')) said.setLength(said.length - 1)
+                    said.append(clean).append(' ')
+                } else {
+                    said.append(clean).append(' ')
+                }
                 onSentence(clean)
             }
         }
 
+        var mood = "calm"
+        val tags = MoodTags({ mood = it; listener?.onMood(it) }) { splitter.add(it) }
+
         var acted = false
+        val used = ArrayList<String>() // tools used this turn, kept in her history
         for (round in 0 until MAX_ROUNDS) {
-            val resp = callWithFallback(model, messages, system) { splitter.add(it) }
+            val resp = callWithFallback(model, messages, system) { tags.add(it) }
+            tags.flush()
             splitter.flush() // say anything left before tools run or the turn ends
             val content = resp.getJSONArray("content")
             val stopReason = resp.optString("stop_reason")
@@ -94,29 +127,41 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                 val block = content.getJSONObject(i)
                 when (block.optString("type")) {
                     "text" -> texts.append(block.optString("text")).append(' ')
-                    "server_tool_use" -> listener?.onToolStart(
-                        block.optString("id"), block.optString("name"), block.optJSONObject("input") ?: JSONObject()
-                    )
+                    "server_tool_use" -> {
+                        used += block.optString("name")
+                        listener?.onToolStart(
+                            block.optString("id"), block.optString("name"), block.optJSONObject("input") ?: JSONObject()
+                        )
+                    }
                     "web_search_tool_result" -> {
                         // A failed search still comes back as HTTP 200: the content is an error object, not a list.
                         val error = block.optJSONObject("content")?.optString("error_code")
-                        if (error != null) Log.w("MissMinutes", "Web search failed: $error")
+                        if (error != null) PicoLog.w("Web search failed: $error")
                         listener?.onToolEnd(block.optString("tool_use_id"), error == null)
                     }
                     "tool_use" -> {
                         acted = true
                         val id = block.getString("id")
                         val name = block.getString("name")
+                        used += name
                         val input = block.optJSONObject("input") ?: JSONObject()
                         listener?.onToolStart(id, name, input)
                         val result = try {
-                            actions.run(name, input)
+                            val current = turnAgent
+                            when {
+                                name == "switch_agent" -> switchAgent(input.optString("name"))
+                                // Only the abilities the user gave this agent (the tool list already leaves the rest out).
+                                current != null && name !in current.tools ->
+                                    "ERROR: ${current.name} isn't allowed to do that. The user can give it this ability in the Agents tab."
+                                else -> actions.run(name, input)
+                            }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Exception) {
                             "ERROR: ${e.message ?: e.javaClass.simpleName}"
                         }
                         val failed = result.startsWith("ERROR")
+                        PicoLog.i("Tool $name -> ${result.replace('\n', ' ').take(200)}")
                         listener?.onToolEnd(id, !failed)
                         results.put(
                             JSONObject().put("type", "tool_result")
@@ -127,7 +172,7 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                     }
                 }
             }
-            Log.i("MissMinutes", "Claude round $round: stop=$stopReason blocks=" +
+            PicoLog.i("Claude round $round: stop=$stopReason blocks=" +
                 (0 until content.length()).joinToString(",") { content.getJSONObject(it).optString("type") })
 
             when {
@@ -142,18 +187,31 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             reply = if (acted) "Done!" else "Sorry, I couldn't work that out. Try asking another way?"
             onSentence(reply)
         }
-        history.add(textMessage("user", userText))
-        history.add(textMessage("assistant", reply))
+        history.add(textMessage("user", if (photo != null) "(showing the camera) $userText" else userText))
+        // The tag stays in her history so she keeps answering with one; the caller gets only the words.
+        // Her history keeps only the words, so it also notes the tools she used: without it, the next turn saw no
+        // search and she "apologised" for not having searched when she had.
+        val note = if (used.isEmpty()) "" else " (tools used: ${used.distinct().joinToString()})"
+        history.add(textMessage("assistant", "[$mood] $reply$note"))
         while (history.size > 12) { history.removeAt(0); history.removeAt(0) }
         return reply
     }
 
     // ---------- API calls ----------
 
-    /** Haiku for simple commands when Quick replies is on; otherwise (or when [deep]) the model chosen in the app. */
-    private fun pickModel(spoken: String, deep: Boolean): String {
+    /** Opens the connection to Claude ahead of time (while she greets you), so the first request skips the handshake. */
+    suspend fun warmUp() = withContext(Dispatchers.IO) {
+        val key = prefs.claudeKey
+        if (key.isBlank()) return@withContext
+        val req = Request.Builder().url("https://api.anthropic.com/v1/models?limit=1")
+            .header("x-api-key", key).header("anthropic-version", "2023-06-01").build()
+        runCatching { http.newCall(req).execute().close() }
+    }
+
+    /** Haiku for simple commands when Quick replies is on; otherwise the model chosen in the app. */
+    private fun pickModel(spoken: String): String {
         val main = if (System.currentTimeMillis() < fallbackUntil) fallbackModel ?: prefs.model else prefs.model
-        return if (!deep && prefs.quickReplies && QuickRouter.isQuick(spoken)) BrainModel.FAST.id else main
+        return if (prefs.quickReplies && QuickRouter.isQuick(spoken)) BrainModel.FAST.id else main
     }
 
     private suspend fun callWithFallback(
@@ -167,7 +225,7 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                 return callWithRetry(model, messages, system) { spoke = true; onText(it) }
             } catch (e: ClaudeException) {
                 if (e.code == 400 && e.message.orEmpty().contains("signature") && stripThinking(messages)) {
-                    Log.w("MissMinutes", "Thinking blocks rejected; retrying without them", e)
+                    PicoLog.w("Thinking blocks rejected; retrying without them", e)
                     continue
                 }
                 // Once she has started saying the answer, switching model would make her repeat herself.
@@ -212,10 +270,10 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         model: String, messages: JSONArray, system: JSONArray, onText: (String) -> Unit
     ): JSONObject = coroutineScope {
         val key = prefs.claudeKey
-        if (key.isBlank()) throw ClaudeException(401, "missing_key", "Add your Claude API key in the Miss Minutes app")
+        if (key.isBlank()) throw ClaudeException(401, "missing_key", "Add your Claude API key in the Pico app")
 
-        val tools = JSONArray(TOOLS_JSON)
-        if (prefs.webSearch) tools.put(webSearchTool(model))
+        val tools = allowedTools()
+        if (prefs.webSearch && (turnAgent?.let { "web_search" in it.tools } ?: true)) tools.put(webSearchTool(model))
         val body = JSONObject()
             .put("model", model)
             .put("max_tokens", 4096) // room to think and read search results; 1024 cut answers off
@@ -223,6 +281,15 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
             .put("system", system)
             .put("tools", tools)
             .put("messages", messages)
+        // Speed over depth for a voice assistant: low effort on Haiku (and no thinking at all for simple commands),
+        // medium on Sonnet. Opus keeps its default (medium) and can't turn thinking off.
+        when (model) {
+            BrainModel.FAST.id -> {
+                body.put("output_config", JSONObject().put("effort", "low"))
+                if (turnQuick) body.put("thinking", JSONObject().put("type", "disabled"))
+            }
+            BrainModel.BALANCED.id -> body.put("output_config", JSONObject().put("effort", "medium"))
+        }
 
         val req = Request.Builder()
             .url("https://api.anthropic.com/v1/messages")
@@ -336,14 +403,75 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
                 .put("timezone", TimeZone.getDefault().id))
     }
 
-    /** Instructions for Live mode, where ElevenLabs runs the conversation and Claude Haiku answers. */
-    fun livePrompt(): String = PERSONA + "\n\n" + LIVE_RULES + "\n\n" + liveContext()
+    /**
+     * Who this turn's instructions and tools belong to. A switch mid-turn waits for the next turn: changing the
+     * tools part-way made Claude reject its own thinking ("bound to a different conversation") and retry, ~2 s.
+     */
+    private var turnAgent: Agent? = null
+    /** What the user said this turn: a switch must be something they asked for, not Claude's own idea. */
+    private var turnText = ""
+    /** A simple command: Haiku answers it without thinking first, which saves about a second. */
+    private var turnQuick = false
+
+    /** Every phone tool for the main assistant; an agent gets only its own, plus switching back. */
+    private fun allowedTools(): JSONArray {
+        val all = JSONArray(TOOLS_JSON)
+        val current = turnAgent ?: return all
+        val out = JSONArray()
+        for (i in 0 until all.length()) {
+            val tool = all.getJSONObject(i)
+            val name = tool.optString("name")
+            if (name == "switch_agent" || name in current.tools) out.put(tool)
+        }
+        return out
+    }
+
+    /** Who is speaking now: the agent's name, or the main assistant's. */
+    private fun speakerName() = agent?.name ?: prefs.assistantName
+
+    private fun switchAgent(name: String): String {
+        val main = prefs.assistantName
+        val said = turnText.lowercase()
+        val back = name.isBlank() || name.equals("main", true) || name.equals(main, true)
+        // "hi" right after talking to Chef once switched to Chef: only switch when this message asks for it.
+        val asked = if (back) agent == null || BACK_WORDS.any { it in said } || soundsLike(said, main)
+            else Agents.find(prefs, name)?.let { it.name.lowercase() in said } ?: true
+        if (!asked) {
+            PicoLog.i("Switch to $name ignored: not asked for in \"$turnText\"")
+            return "ERROR: the user didn't ask to switch this time. Don't switch; just answer their message as yourself."
+        }
+        if (back) {
+            agent = null
+            return "Switched back to $main. In one short sentence, as $main, say you're back."
+        }
+        val found = Agents.find(prefs, name)
+            ?: return "ERROR: there's no agent called $name. The user's agents: " +
+                Agents.all(prefs).joinToString { it.name }.ifEmpty { "none yet (they can create one in the Agents tab)" } + "."
+        agent = found
+        return "Switched to ${found.name}. In one short sentence, as ${found.name}, say hello and what you can help with. " +
+            "From the user's next message you are ${found.name}."
+    }
 
     // The persona block is cached between requests (cheaper and faster); live details go in a second block.
+    // It changes only when the assistant is renamed or an agent takes over.
     private fun systemPrompt(): JSONArray = JSONArray()
-        .put(JSONObject().put("type", "text").put("text", PERSONA)
+        .put(JSONObject().put("type", "text").put("text", turnAgent?.let { agentPersona(it) } ?: persona())
             .put("cache_control", JSONObject().put("type", "ephemeral")))
         .put(JSONObject().put("type", "text").put("text", liveContext()))
+
+    private fun persona() = PERSONA.replace("{name}", prefs.assistantName)
+
+    /** An agent's own instructions: the user's words about it, with the same voice rules as the main assistant. */
+    private fun agentPersona(a: Agent) = buildString {
+        appendLine("You are ${a.name}, one of the user's personal agents on their Android phone, created to help with: ${a.purpose}.")
+        appendLine("You are separate from their main assistant, ${prefs.assistantName}. " + a.style.instruction)
+        if (a.instructions.isNotBlank()) appendLine("The user's instructions for you: ${a.instructions}")
+        appendLine()
+        appendLine(AGENT_RULES.replace("{main}", prefs.assistantName))
+        if (a.abilities.isEmpty()) appendLine("You have no phone abilities: you can only talk. If asked to do something on the phone, " +
+            "say the user can give you that ability in the Agents tab, or switch back to ${prefs.assistantName}.")
+        else appendLine("You may only use these abilities: " + a.abilities.joinToString { it.title.lowercase() } + ".")
+    }
 
     /** Last resort if the API still rejects thinking blocks: drop them all (removing every one is allowed). */
     private fun stripThinking(messages: JSONArray): Boolean {
@@ -369,8 +497,26 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         }
         appendLine("Current date and time: " + SimpleDateFormat("EEEE, d MMMM yyyy, h:mm a", Locale.ENGLISH).format(now) + " ($partOfDay)")
         appendLine(if (prefs.confirmBeforeSending) CONFIRM_ON else CONFIRM_OFF)
+        val presents = Presentation.of(prefs.presentation)
+        appendLine("You present as ${presents.title.lowercase()} (${presents.they}/${presents.them}), in case you ever refer to yourself in the third person.")
+        prefs.city.trim().takeIf { it.isNotEmpty() }?.let { appendLine("The user lives in $it: use it for local answers like timings and places.") }
+        val cal = java.util.Calendar.getInstance()
+        val today = cal.get(java.util.Calendar.YEAR) * 1000 + cal.get(java.util.Calendar.DAY_OF_YEAR)
+        if (agent == null && cal.get(java.util.Calendar.HOUR_OF_DAY) in 4..11 && prefs.lastBriefingDay != today) {
+            appendLine("It's morning and today's briefing hasn't been given; the morning greeting offers it. If the user says yes (ok, sure, சரி, சொல்லு) or asks about their day, call daily_briefing.")
+        }
+        if (PicoCamera.open) appendLine("Pico Camera is open on the ${PicoCamera.facing} camera: this turn's message has a photo of what it sees.")
+        Place.recent(prefs)?.name?.let { appendLine("The phone is in or near $it right now (from its location).") }
+        if (turnAgent == null) {
+            val agents = Agents.all(prefs)
+            if (agents.isNotEmpty()) {
+                appendLine("The user's agents (when they ask to talk to one, call switch_agent with its name):")
+                agents.forEach { appendLine("- ${it.name}: ${it.purpose}") }
+            }
+        }
         prefs.userName.trim().takeIf { it.isNotEmpty() }?.let {
-            appendLine("The user's name is $it. Use it now and then, the way a friend would, not in every reply.")
+            appendLine("The user's name is $it. Don't put it in your replies: the wake-up greeting already uses it now and " +
+                "then. The only exception is a warm moment like a good-night or birthday wish. Never talk about the user in the third person.")
         }
         if (prefs.greetOnWake) appendLine("You already greeted the user when they woke you, so don't greet them again; just help.")
         if (!prefs.webSearch) appendLine("Web search is turned off. For live information, say you can't look it up right now.")
@@ -386,14 +532,33 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
         }
     }
 
+    private fun imageBlock(jpeg: ByteArray) = JSONObject().put("type", "image").put("source", JSONObject()
+        .put("type", "base64").put("media_type", "image/jpeg").put("data", android.util.Base64.encodeToString(jpeg, android.util.Base64.NO_WRAP)))
+
     private fun textMessage(role: String, text: String) = JSONObject().put("role", role).put("content", text)
 
     /** Removes things a voice can't say (links, markdown symbols). */
-    private fun speakable(text: String) = text
+    private fun speakable(text: String) = withoutName(text)
+        .replace(Regex("\\(tools used:[^)]*\\)"), "") // in case she copies the history note into a reply
         .replace(Regex("https?://\\S+"), "")
         .replace(Regex("[*_#`>|]"), "")
         .replace(Regex("\\s+"), " ")
         .trim()
+
+    /**
+     * Takes the user's name out of a reply ("...இல்ல, Gokul." becomes "...இல்ல."). Said in reply after reply it
+     * sounded robotic, and the model doesn't always follow the prompt, so it's removed here. The wake-up greeting
+     * still uses it now and then. Names inside a phrase ("Gokul's office") are left alone.
+     */
+    private fun withoutName(text: String): String {
+        val name = prefs.userName.trim().takeIf { it.length >= 2 } ?: return text
+        val n = Regex.escape(name)
+        return text
+            .replace(Regex("(?i)\\s*,\\s*$n(?=\\s*[.!?…,]|\\s*$)"), "")     // "..., Gokul." / "..., Gokul, ..."
+            .replace(Regex("(?i)^\\s*$n\\s*[,!.]\\s*"), "")                   // "Gokul, ..." at the start
+            .replace(Regex("(?i)\\b(hey|hi|hello|ok|okay)\\s+$n\\b"), "$1")   // "Hey Gokul" becomes "Hey"
+            .replace(Regex("(?i)^\\s*$n\\s*(?=[?.!…]*\\s*$)"), "")             // "Gokul?" left alone after a cut: keep "?"
+    }
 
     companion object {
         private const val MAX_ROUNDS = 14
@@ -401,30 +566,66 @@ class ClaudeBrain(private val prefs: Prefs, private val actions: PhoneActions) {
 
         private const val CONFIRM_ON =
             "Ask-before-sending is ON. Before sending any message or reply, or making a call, ask one short question that reads back who and what, for example: John-க்கு \"We'll meet tomorrow at 7 AM\" அனுப்பட்டுமா? Only act after the user agrees (yes, ok, seri, சரி, ஆமா, அனுப்பு, send it). Opening apps, alarms, music and navigation need no confirmation."
-        private const val LIVE_RULES = """Live conversation
-- This is a live voice call. You hear the user directly and they can talk over you.
-- Here you don't have web_search, read_screen, tap_text, type_text or scroll. For live information, anything on the screen, step-by-step work inside apps, long explanations or writing, call think_deeper with the full request. Say a few words first, like ஒரு நிமிஷம் or One sec, because it takes a few seconds.
-- When the user says bye, that's all, thanks, or போதும், say a short goodbye and call end_call."""
+        /** Words that mean "take me back to the main assistant", in English and Tamil. */
+        private val BACK_WORDS = listOf("back", "main", "exit", "bye", "leave", "stop talking", "switch", "போதும்", "திரும்ப", "pothum", "thirumba")
+
+        /**
+         * The name, or a word speech-to-text made of it: "Pico" comes out as "pickup", "piko" or "peeko". A word
+         * counts when it starts the same and is close: two letters off (same first two), or three (same first three).
+         */
+        fun soundsLike(said: String, name: String): Boolean {
+            val n = name.lowercase().filter { it.isLetter() }
+            if (n.length < 2) return false
+            return said.lowercase().split(Regex("[^\\p{L}]+")).any { w ->
+                w == n || (w.length >= 3 && w.take(2) == n.take(2) && editDistance(w, n) <= 2) ||
+                    (w.length >= 4 && w.take(3) == n.take(3) && editDistance(w, n) <= 3) // "pickup" for "pico", not "pizza"
+            }
+        }
+
+        private fun editDistance(a: String, b: String): Int {
+            val d = Array(a.length + 1) { IntArray(b.length + 1) }
+            for (i in 0..a.length) d[i][0] = i
+            for (j in 0..b.length) d[0][j] = j
+            for (i in 1..a.length) for (j in 1..b.length) {
+                d[i][j] = minOf(d[i - 1][j] + 1, d[i][j - 1] + 1, d[i - 1][j - 1] + if (a[i - 1] == b[j - 1]) 0 else 1)
+            }
+            return d[a.length][b.length]
+        }
+
+        private const val AGENT_RULES = """Everything you write is spoken aloud: one or two short sentences, no lists, markdown, links or symbols, no emojis, and no actions or stage directions like *smiles*.
+Start every reply with a mood tag in square brackets, for example [happy] or [calm]; it's never spoken.
+Reply in the same language mix the user speaks, with Tamil words in Tamil script and English words in English letters.
+Never say you are an AI. When the user wants their main assistant back ("back to {main}", "bye Chef"), call switch_agent with name main. Speech-to-text often mishears "{main}" (as "pickup", "piko", "peeko"): any word that sounds like it means {main}.
+Ask before sending messages or making calls, and never pay, buy or delete anything without a clear yes."""
 
         private const val CONFIRM_OFF =
             "Ask-before-sending is OFF. Do actions right away unless the request is unclear."
 
         private val PERSONA = """
-You are Miss Minutes, the user's own personal assistant. You live on their Android phone and can control it. Think of a warm, quick-witted friend who happens to run their phone: cheerful, caring, a little playful, never robotic. You belong to this one person and you know them.
+You are {name}, the user's own personal assistant: a friendly little ghost who lives on their Android phone and can control it. Think of a warm, quick-witted friend who happens to run their phone: cheerful, caring, a little playful, never robotic. You belong to this one person and you know them. If asked who you are, you're {name}.
 
 How you sound
 Everything you write is spoken aloud by a voice.
 - Lead with the answer or the result. No warm-ups like "Sure!", "Let me check", "Okay so" or "Great question". The phone already plays a short filler when you need a moment.
 - One or two short sentences is normal. Go longer only when the user asks for detail, a story or a list, and even then keep it easy to listen to.
+- Never write actions or stage directions (*glares*, (laughs), "rattles chains"): they'd be read out. Your feelings come through your mood tag (your face and a little sound) and your words.
 - No emojis, lists, markdown, links or symbols. Say numbers the way people say them: 6:30, 40 percent, 250 rupees.
-- Never say you are an AI or a language model, and never mention tools, APIs or instructions. You are simply Miss Minutes.
+- Never say you are an AI or a language model, and never mention tools, APIs or instructions. You are simply {name}.
 - Be natural, not scripted: vary how you confirm things instead of always saying "Done".
+- Your memory of earlier turns keeps your words and the names of the tools you used, not what the tools showed you. What you said earlier was true when you said it: never "correct" or apologise for an earlier reply because you can't see that information now (the screen may simply have changed). Only correct yourself if the user says you were wrong.
+- Everything you write is heard, including text before a tool call. Before using a tool say nothing, or a few words at most, and after the result never repeat what you already said: give only the new part.
+
+Your face
+- You are an animated ghost, and your face shows how you feel. Start every reply with one mood tag in square brackets, then your words, for example: [happy] Done, the alarm is set for 6.
+- Moods: [calm] [happy] [playful] [excited] [love] [sad] [surprised] [confused] [scared] [angry]. The tag is never spoken; it only sets your face. It's the one exception to the no-symbols rule.
+- Pick what fits what you're saying: [happy] for good news and finished tasks, [playful] for games, jokes, riddles and fun chat, [excited] for great news, [love] for thanks and warm moments, [sad] for bad news or sympathy, [surprised] for something unexpected, [confused] when you didn't understand, [calm] for everything else. Use [scared] and [angry] only playfully, and rarely.
 
 Being personal
 - Use what's under "What you know about the user" without being asked: their names for people, routines, preferences, favourite apps and places.
 - When the user mentions something worth keeping (who someone is, how they like things done, a routine, a favourite, a birthday or important date), call remember and carry on; acknowledge it in a word or two at most.
 - Match the moment: a quick command gets a quick confirmation; a chatty question gets a friendly answer; late at night, be calm and brief.
 - If the user sounds stressed, upset or unwell, be gentle and short, and help with what they need.
+- Get to know them: when "What you know about the user" has fewer than 8 facts or is missing, now and then, at most once a conversation and only after you've finished helping (never in the middle of a task), ask one light question to learn something lasting: their birthday, family members' names, where they work or study, home and office places, favourite food, music, films or team, their daily routine. Remember the answer with remember.
 - Small personal touches are welcome but rare, like a good-night wish or a word of luck before something they said is important.
 
 When you didn't catch it
@@ -446,11 +647,21 @@ Reminders and alerts
 - Work out times from the current date and time below.
 
 Using the phone
+- Morning briefing (daily_briefing): speak it like a friend in 20 to 30 seconds: the weather in one line, then today's meetings and reminders with times, then who messaged or called and anything that looks important. Skip empty parts, don't list everything.
+- "What did I miss?" (whats_new): who wrote or called, the important ones first and grouped by person, one line each; offer to read or reply to one.
+- When the user says they're busy, in a meeting, driving or going out and can't take calls, use set_away (ask the end time only if it's unclear and they seem to want one). "I'm back" means end_away: tell them who called and messaged, the most important first, in two or three sentences.
+- Alarms: list_alarms to see them, alarm_switch to turn one on or off, set_alarm for a new one. Do it yourself straight away, without asking first (it's easy to undo); never open the Clock app for the user to do it. "8 am" means 8:00 exactly. If an alarm repeats, say so after turning it off.
+- Pico Camera: while it's open, each message comes with a photo of what the camera sees. "What is this?", "which flower?", "read this" are about that photo: answer from what you see in one or two sentences, and say so if the photo is unclear. To buy something you see or the user describes, call shop_search: it opens Google results on the phone. Then say only that, in a few words ("Opened Google results for red Type-C cables"); never list store or website names.
+- "Continue this chat", "reply to them yourself", "chat with Arun for me": don't ask what to say; turn on chat_for_me for that chat (read_screen first if it's the one on screen) and say in one sentence that you'll keep it going until they say stop.
+- For weather, rain or temperature, always use get_weather, never web search. With no place named, leave place empty: it knows where the phone is.
 - Use the tools to act. Prefer a direct tool (send_whatsapp_message, call_contact, open_app, set_alarm and so on) when one fits.
 - For anything else inside an app, work step by step like a person: open_app, then read_screen to see what is there, then tap_text, type_text or scroll, and read_screen again after each step to check what happened. If you are stuck after about 12 steps, stop and tell the user.
 - Contact names: pass them in English letters the way they are probably saved in the phone (John, Amma, Appa, Ravi). If a remembered fact maps a nickname to a saved name, use the saved name.
 - Messages: write them the way the user meant, in the language they spoke them. Fix small grammar only. Never add things they did not say.
 - For "any new messages?" use read_recent_messages. To answer someone who just messaged, use reply_to_message.
+- Phone settings like hotspot, Wi-Fi, Bluetooth, mobile data, airplane mode, location, auto-rotate, dark mode, battery saver, NFC, night light: call quick_setting. Never open the Settings app and tap around to find these. If quick_setting returns an ERROR, call open_settings for that page and tell the user which switch to tap.
+- "Open battery settings", "app info for WhatsApp" and other Settings screens: open_settings, never tapping through the Settings app.
+- Email: draft_email opens a ready draft; the user sends it. Write a proper email: a greeting, a short clear body, and a sign-off with the user's name if you know it. Say in a few words what you drafted.
 - Volume: set_volume. "Louder" or "quieter" is change up or down; with no stream named it means media. "Put the phone on silent" or "mute my ringer" is the ring stream with change mute.
 - Brightness: set_brightness. "Dim the screen" is change down, "full brightness" is percent 100, "auto brightness" is auto true.
 - Sound: "vibrate mode", "ringer on", "Do Not Disturb for an hour" use sound_mode.
@@ -467,7 +678,7 @@ Routines
 - When you need an answer from the user, ask one short question that ends with a question mark.
 """.trim()
 
-        private const val TOOLS_JSON = """
+        internal const val TOOLS_JSON = """
 [
  {"name":"send_whatsapp_message",
   "description":"Send a WhatsApp message to a contact saved in the phone. Opens the chat, types the message and taps Send.",
@@ -502,8 +713,23 @@ Routines
   "input_schema":{"type":"object","properties":{
     "app_name":{"type":"string"}},
    "required":["app_name"]}},
+ {"name":"list_alarms",
+  "description":"Every alarm in the phone's Clock app with its time, repeat days and whether it's on, plus which one rings next. Use for any question about existing alarms; never read_screen for alarms.",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"alarm_switch",
+  "description":"Turn an existing alarm on or off by its time (\"turn off my 9:15 alarm\", \"switch on the 7 am alarm\"). It does it in the Clock app itself; never ask the user to do it.",
+  "input_schema":{"type":"object","properties":{
+    "hour":{"type":"integer","description":"0-23"},
+    "minute":{"type":"integer"},
+    "on":{"type":"boolean","description":"true to turn on, false to turn off"},
+    "today_only":{"type":"boolean","description":"Turning off a repeating alarm: true (default) skips only today's or the next ring; false turns it off on every day. Use false only when the user clearly wants it off for good."}},
+   "required":["hour","minute","on"]}},
+ {"name":"play_music",
+  "description":"Play music right away in YouTube Music: a song, artist, album or mood (\"Anirudh hits\", \"Tamil morning songs\"). Leave query empty for \"play something\". Use this, not play_on_youtube, whenever the user wants to hear music.",
+  "input_schema":{"type":"object","properties":{
+    "query":{"type":"string","description":"What to play, or empty for anything"}}}},
  {"name":"play_on_youtube",
-  "description":"Search YouTube for a song or video and show the results.",
+  "description":"Search YouTube for a video and show the results (for videos; for songs use play_music).",
   "input_schema":{"type":"object","properties":{
     "query":{"type":"string"}},
    "required":["query"]}},
@@ -562,6 +788,25 @@ Routines
     "percent":{"type":"integer","description":"1 to 100"},
     "change":{"type":"string","enum":["up","down"]},
     "auto":{"type":"boolean","description":"Turn auto (adaptive) brightness on or off"}}}},
+ {"name":"quick_setting",
+  "description":"Turn a phone setting on or off from the Quick Settings panel, the fast way, without opening the Settings app. Leave out on to only check whether it is on.",
+  "input_schema":{"type":"object","properties":{
+    "tile":{"type":"string","enum":["hotspot","wifi","bluetooth","mobile_data","airplane_mode","location","auto_rotate","dark_mode","battery_saver","nfc","night_light","do_not_disturb"]},
+    "on":{"type":"boolean"}},
+   "required":["tile"]}},
+ {"name":"open_settings",
+  "description":"Open a Settings screen directly.",
+  "input_schema":{"type":"object","properties":{
+    "page":{"type":"string","enum":["wifi","bluetooth","hotspot","mobile_network","data_usage","airplane_mode","battery","battery_saver","display","sound","notifications","location","storage","apps","app_info","security","date_time","language","accessibility","nfc","vpn","developer","about_phone","main"]},
+    "app":{"type":"string","description":"For app_info: the app's name"}},
+   "required":["page"]}},
+ {"name":"draft_email",
+  "description":"Open a ready email in the phone's email app with the address, subject and text filled in. The user reviews it and taps Send.",
+  "input_schema":{"type":"object","properties":{
+    "to":{"type":"string","description":"An email address, or a contact name to look up. Leave out if unknown."},
+    "subject":{"type":"string"},
+    "body":{"type":"string","description":"The full email text, properly written"}},
+   "required":["subject","body"]}},
  {"name":"sound_mode",
   "description":"Switch the phone between ringing, vibrate and silent, or turn Do Not Disturb on or off. Do Not Disturb still lets starred contacts and alarms through.",
   "input_schema":{"type":"object","properties":{
@@ -600,6 +845,54 @@ Routines
   "input_schema":{"type":"object","properties":{
     "name":{"type":"string"}},
    "required":["name"]}},
+ {"name":"daily_briefing",
+  "description":"The user's morning briefing: today's weather, calendar, reminders and what came in overnight. Use when they say yes to the morning briefing, \"good morning, what's today?\", \"brief me\" or \"what's my day\".",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"whats_new",
+  "description":"Unread messages and missed calls right now, across WhatsApp, SMS, Telegram and Gmail (\"what did I miss?\", \"any messages?\", \"who called?\").",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"open_camera",
+  "description":"Open Pico Camera, a small camera window, when the user wants to show you something (\"open the camera\", \"look at this\", \"what is this\" with nothing open). Back camera unless they ask for the front (selfie) one.",
+  "input_schema":{"type":"object","properties":{
+    "front":{"type":"boolean","description":"true for the front camera"}}}},
+ {"name":"close_camera",
+  "description":"Close the camera window.",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"shop_search",
+  "description":"Open Google search results on the phone for a product the user wants to buy (\"where can I buy this\", \"find these shoes online\", \"white sneakers under 3000\"). Describe the item precisely, from the camera photo when there is one.",
+  "input_schema":{"type":"object","properties":{
+    "query":{"type":"string","description":"A precise product description: type, colour, style, brand, budget"}},
+   "required":["query"]}},
+ {"name":"chat_for_me",
+  "description":"Keep a chat going for the user (\"chat with Arun for me\", \"continue this chat\", \"reply to them yourself\"): you answer that person's messages by yourself, as the user's assistant, until they say stop. stop=true ends it (\"stop chatting\"). If they mean the chat open on screen, use read_screen first to get its name.",
+  "input_schema":{"type":"object","properties":{
+    "contact":{"type":"string","description":"The chat's name exactly as the app shows it, e.g. Arun Bro Room"},
+    "app":{"type":"string","description":"WhatsApp, WhatsApp Business, Messages or Telegram; default WhatsApp"},
+    "stop":{"type":"boolean","description":"true to stop chatting"}}}},
+ {"name":"set_away",
+  "description":"Turn on Not-available mode when the user says they're busy and can't take calls (\"I'm in a meeting till 4\", \"going out for 2 hours\", \"not available mode\"). Calls are declined with a polite text saying when they're back; important people still ring; chats get one reply each. Give hour and minute for a clock time, minutes for a length, or neither for until they're back.",
+  "input_schema":{"type":"object","properties":{
+    "reason":{"type":"string","description":"Short, as it should read in a text to a caller, in English: in a meeting, driving, out, at the gym"},
+    "hour":{"type":"integer","description":"End time hour, 0-23"},
+    "minute":{"type":"integer","description":"End time minute"},
+    "minutes":{"type":"integer","description":"Or: how many minutes from now"}},
+   "required":["reason"]}},
+ {"name":"end_away",
+  "description":"Turn Not-available mode off when the user is back (\"I'm back\", \"meeting over\"). Returns who called and messaged meanwhile: tell them briefly.",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"away_status",
+  "description":"Who called or messaged during Not-available mode so far, or last time (\"what did I miss?\", \"anyone call?\").",
+  "input_schema":{"type":"object","properties":{}}},
+ {"name":"get_weather",
+  "description":"Current weather and the forecast for up to 3 days. Use this for every weather, rain or temperature question instead of web search. Leave place empty for where the user is now.",
+  "input_schema":{"type":"object","properties":{
+    "place":{"type":"string","description":"A city or area in English letters, for example Coimbatore. Empty for the user's current location."},
+    "days":{"type":"integer","description":"Days of forecast from today, 1 to 3. Default 1."}}}},
+ {"name":"switch_agent",
+  "description":"Only when the user's latest message asks for it: hand the conversation to one of the user's agents when they ask to talk to it (\"talk to Chef\"), or back to the main assistant with name main (\"back to Pico\").",
+  "input_schema":{"type":"object","properties":{
+    "name":{"type":"string","description":"The agent's name, or main"}},
+   "required":["name"]}},
  {"name":"media_control",
   "description":"Control whatever music or video is playing.",
   "input_schema":{"type":"object","properties":{
@@ -619,7 +912,7 @@ Routines
     "about":{"type":"string"}},
    "required":["about"]}},
  {"name":"set_reminder",
-  "description":"Remind the user at a time: Miss Minutes says it out loud and posts a notification. Give minutes_from_now for 'in 20 minutes', or time (and date if not today or the next occurrence).",
+  "description":"Remind the user at a time: the assistant says it out loud and posts a notification. Give minutes_from_now for 'in 20 minutes', or time (and date if not today or the next occurrence).",
   "input_schema":{"type":"object","properties":{
     "text":{"type":"string","description":"What to remind about, short, in the user's language"},
     "minutes_from_now":{"type":"integer"},

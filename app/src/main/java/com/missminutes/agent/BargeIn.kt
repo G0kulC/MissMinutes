@@ -20,8 +20,13 @@ class BargeIn {
     companion object {
         private const val RATE = VoiceRecorder.SAMPLE_RATE
         private const val CHUNK = 800                 // 50 ms
-        private const val LEARN_CHUNKS = 10           // first 500 ms: measure her echo
-        private const val SPEECH_CHUNKS = 6           // 300 ms of loud sound counts as you talking
+        private const val LEARN_CHUNKS = 10           // first 500 ms: learn how much of her voice the mic picks up
+        private const val SPEECH_CHUNKS = 8           // 400 ms of loud sound counts as you talking
+        /** How much louder than her expected echo you must be. */
+        private const val ECHO_MARGIN = 2.5
+        /** Her voice below this (raw RMS) is a pause: nothing to learn from. */
+        private const val VOICE_FLOOR = 300.0
+        private const val MAX_RATIO = 2.0
         private const val PREROLL_CHUNKS = 10         // keep the last 500 ms so your first words aren't lost
         private const val MIN_THRESHOLD = 1600.0
     }
@@ -34,7 +39,7 @@ class BargeIn {
      * or returns null once [cancel] is called (she finished, or the session ended).
      */
     @SuppressLint("MissingPermission")
-    fun listen(onSpeech: () -> Unit): ByteArray? {
+    fun listen(voiceRms: () -> Float, onSpeech: () -> Unit): ByteArray? {
         cancelled = false
         val minBuf = AudioRecord.getMinBufferSize(RATE, AudioFormat.CHANNEL_IN_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val rec = runCatching {
@@ -53,9 +58,12 @@ class BargeIn {
 
         val buf = ShortArray(CHUNK)
         val recent = ArrayDeque<ByteArray>()
-        var echo = 0.0
+        // Her echo rises and falls with how loud she is at each moment, so the bar does too: it's her current
+        // loudness times how much of it reaches the mic. A bar learned once from a soft start ("Ooh…") let the
+        // louder words after it ("yes please!") count as you talking.
+        var ratio = 0.0
+        val her = ArrayDeque<Double>() // her loudness over the last 200 ms: the echo arrives a little late
         var learned = 0
-        var threshold = MIN_THRESHOLD
         var loud = 0
         rec.startRecording()
         try {
@@ -68,12 +76,16 @@ class BargeIn {
                 recent.addLast(bytes.array())
                 if (recent.size > PREROLL_CHUNKS) recent.removeFirst()
                 val rms = sqrt(sum / n)
+                her.addLast(voiceRms().toDouble())
+                if (her.size > 4) her.removeFirst()
+                val voice = her.max()
 
                 if (learned < LEARN_CHUNKS) {
-                    echo = max(echo, rms)
-                    if (++learned == LEARN_CHUNKS) threshold = max(MIN_THRESHOLD, echo * 2.2)
+                    if (voice > VOICE_FLOOR) ratio = max(ratio, (rms / voice).coerceAtMost(MAX_RATIO))
+                    learned++
                     continue
                 }
+                val threshold = max(MIN_THRESHOLD, ratio * voice * ECHO_MARGIN)
                 if (rms > threshold) {
                     if (++loud >= SPEECH_CHUNKS) {
                         onSpeech()
@@ -83,8 +95,11 @@ class BargeIn {
                     }
                 } else {
                     loud = 0
-                    // Her echo drifts as she speaks louder or softer; follow it slowly.
-                    threshold = max(MIN_THRESHOLD, threshold * 0.98 + rms * 2.2 * 0.02)
+                    // Keep learning slowly, in case the room or the volume changes; it may rise only 2% a step, so
+                    // your quieter first syllables can't push the bar up past your own voice.
+                    if (voice > VOICE_FLOOR) {
+                        ratio = max(ratio * 0.995, minOf(rms / voice, ratio * 1.02, MAX_RATIO))
+                    }
                 }
             }
             return null

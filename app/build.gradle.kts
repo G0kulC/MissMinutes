@@ -32,4 +32,13 @@ dependencies {
     implementation("com.alphacephei:vosk-android:0.3.47@aar")
     // The ghost's animations (assets/ghost, made by tools/ghost_lottie.py).
     implementation("com.airbnb.android:lottie:6.4.0")
+    // Pico Camera: the camera preview in a small window (CameraX), on a plain ComponentActivity (no AppCompat).
+    implementation("androidx.activity:activity-ktx:1.9.3")
+    implementation("androidx.camera:camera-camera2:1.3.4")
+    implementation("androidx.camera:camera-lifecycle:1.3.4")
+    implementation("androidx.camera:camera-view:1.3.4")
+
+    testImplementation("junit:junit:4.13.2")
+    // The real org.json for unit tests (Android's copy is only stubs off the phone).
+    testImplementation("org.json:json:20231013")
 }

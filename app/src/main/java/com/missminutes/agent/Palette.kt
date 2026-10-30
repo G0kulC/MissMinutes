@@ -5,7 +5,7 @@ import android.graphics.Color
 import android.graphics.Typeface
 
 /**
- * Miss Minutes colours. State colours carry meaning everywhere in the app:
+ * Pico colours. State colours carry meaning everywhere in the app:
  * amber = listening, teal = working, coral = speaking.
  */
 object Palette {
@@ -18,6 +18,9 @@ object Palette {
     val CORAL = 0xFFFF7A6B.toInt()      // speaking, errors
     val TEAL = 0xFF3ED7C4.toInt()       // working, success
     val PLUM = 0xFF7C5C8A.toInt()       // idle
+    val HINT = 0xFFA397AD.toInt()       // placeholder text: 4.5:1 on fields (it was 2.9:1)
+    val FIELD_EDGE = 0xFF6E6178.toInt() // a text field's outline: 3:1 against the card
+    val TRACK_OFF = 0xFF6E6178.toInt()  // an off switch's track and a slider's empty part: 3:1 against the card
 
     fun alpha(color: Int, a: Int) =
         Color.argb(a.coerceIn(0, 255), Color.red(color), Color.green(color), Color.blue(color))

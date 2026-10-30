@@ -27,21 +27,11 @@ import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
 
-/** A service that streams speech as 16-bit mono PCM at [SarvamClient.STREAM_RATE] Hz. */
-interface TtsEngine {
-    /** Names the voice, so cached clips are kept per voice. */
-    val speaker: String
-    fun speechCall(text: String): okhttp3.Call
-    fun checked(resp: okhttp3.Response): okhttp3.Response
-    /** Another service to try if this one fails before any sound. */
-    val backup: TtsEngine? get() = null
-}
-
 /**
- * Speaks with the chosen voice (Sarvam or ElevenLabs) and reports loudness while playing, so the dial moves in sync.
- * Falls back to Sarvam, then to Android's built-in voice, if that fails.
+ * Speaks with the Sarvam voice and reports loudness while playing, so the dial moves in sync.
+ * Falls back to Android's built-in voice if Sarvam fails.
  */
-class VoicePlayer(context: Context, private val voice: TtsEngine) {
+class VoicePlayer(context: Context, private val voice: SarvamClient) {
     companion object {
         /** 6 seconds of 16-bit mono audio. */
         private const val MAX_CACHED_BYTES = SarvamClient.STREAM_RATE * 2L * 6
@@ -54,6 +44,7 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
     private val tts = TextToSpeech(appContext) { status -> ttsReady = status == TextToSpeech.SUCCESS }
     @Volatile private var currentCall: Call? = null
     @Volatile private var track: AudioTrack? = null
+    @Volatile private var levelsNow: LevelTrack? = null
     @Volatile private var stopRequested = false
 
     private val attributes = AudioAttributes.Builder()
@@ -72,25 +63,14 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
         stopRequested = false
         var started = false
         try {
-            stream(text, cache, voice) { started = true; onStart() }
+            stream(text, cache) { started = true; onStart() }
         } catch (e: CancellationException) {
             throw e
         } catch (e: Exception) {
             if (stopRequested) return
-            if (started) { Log.w("MissMinutes", "Voice stream broke off", e); return }
+            if (started) { PicoLog.w("Voice stream broke off", e); return }
             if (!fallback) throw e
-            voice.backup?.let { backup ->
-                Log.w("MissMinutes", "Voice failed, using Sarvam instead", e)
-                try {
-                    stream(text, false, backup) { started = true; onStart() }
-                    return
-                } catch (e2: CancellationException) {
-                    throw e2
-                } catch (e2: Exception) {
-                    if (stopRequested || started) return
-                }
-            }
-            Log.w("MissMinutes", "Voice failed, using Android voice", e)
+            PicoLog.w("Voice failed, using Android voice", e)
             onStart()
             speakWithAndroid(text)
         }
@@ -98,11 +78,12 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
 
     /**
      * Downloads and keeps the audio for [texts] without playing it, so they're instant later.
-     * Recordings for anything else (an old name, voice or greeting) are deleted.
+     * Recordings for anything else (an old name, voice or greeting) are deleted, unless [prune] is false (an
+     * agent's voice is added next to the assistant's, not instead of it).
      */
-    suspend fun prefetch(texts: List<String>) = withContext(Dispatchers.IO) {
+    suspend fun prefetch(texts: List<String>, prune: Boolean = true) = withContext(Dispatchers.IO) {
         val wanted = texts.map { cacheFile(it) }.toSet()
-        cacheFile("").parentFile?.listFiles()?.filter { it !in wanted }?.forEach { it.delete() }
+        if (prune) cacheFile("").parentFile?.listFiles()?.filter { it !in wanted }?.forEach { it.delete() }
         for (text in texts) {
             val file = cacheFile(text)
             if (file.exists()) continue
@@ -112,7 +93,7 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
                     voice.checked(resp).body!!.byteStream().use { input -> tmp.outputStream().use { input.copyTo(it) } }
                     keepIfSane(tmp, file)
                 }
-            }.onFailure { Log.w("MissMinutes", "Couldn't prefetch voice", it) }
+            }.onFailure { PicoLog.w("Couldn't prefetch voice", it) }
         }
     }
 
@@ -122,7 +103,7 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
      */
     private fun keepIfSane(tmp: File, file: File) {
         if (tmp.length() in 1..MAX_CACHED_BYTES) tmp.renameTo(file)
-        else { Log.w("MissMinutes", "Discarded a ${tmp.length()}-byte voice clip"); tmp.delete() }
+        else { PicoLog.w("Discarded a ${tmp.length()}-byte voice clip"); tmp.delete() }
     }
 
     /** True if [text] is already on the phone in the current voice, so it plays instantly. */
@@ -135,10 +116,10 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
         return File(dir, "$key.pcm")
     }
 
-    private suspend fun stream(text: String, cache: Boolean, engine: TtsEngine, onFirstAudio: () -> Unit) = coroutineScope {
+    private suspend fun stream(text: String, cache: Boolean, onFirstAudio: () -> Unit) = coroutineScope {
         val rate = SarvamClient.STREAM_RATE
         val cached = if (cache) cacheFile(text).takeIf { it.exists() } else null
-        val call = if (cached == null) engine.speechCall(text) else null
+        val call = if (cached == null) voice.speechCall(text) else null
         currentCall = call
         val minBuf = AudioTrack.getMinBufferSize(rate, AudioFormat.CHANNEL_OUT_MONO, AudioFormat.ENCODING_PCM_16BIT)
         val track = AudioTrack.Builder()
@@ -155,6 +136,7 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
             .build()
         this@VoicePlayer.track = track
         val levels = LevelTrack(rate)
+        levelsNow = levels
         var meter: Job? = null
         try {
             withContext(Dispatchers.IO) {
@@ -163,7 +145,7 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
                 val tee = if (cache && cached == null) File(cacheFile(text).path + ".tmp").outputStream() else null
                 var complete = false
                 try {
-                    val input = cached?.inputStream() ?: engine.checked(resp!!).body!!.byteStream()
+                    val input = cached?.inputStream() ?: voice.checked(resp!!).body!!.byteStream()
                     val buf = ByteArray(4096)
                     var carry = -1 // a stray odd byte waiting for its partner
                     while (isActive && !stopRequested && call?.isCanceled() != true) {
@@ -206,8 +188,16 @@ class VoicePlayer(context: Context, private val voice: TtsEngine) {
             runCatching { track.stop() }
             track.release()
             if (this@VoicePlayer.track === track) this@VoicePlayer.track = null
+            if (levelsNow === levels) levelsNow = null
             if (currentCall === call) currentCall = null
         }
+    }
+
+    /** How loud she is right now (raw RMS of the audio playing), so her echo can be told apart from your voice. */
+    fun outputRms(): Float {
+        val t = track ?: return 0f
+        val l = levelsNow ?: return 0f
+        return runCatching { l.rawAt(t.playbackHeadPosition) }.getOrDefault(0f)
     }
 
     private suspend fun speakWithAndroid(text: String) = coroutineScope {
@@ -276,6 +266,9 @@ private class LevelTrack(rate: Int, windowMs: Int = 30) {
         }
         frames += pcm.size / 2
     }
+
+    @Synchronized fun rawAt(frame: Int): Float =
+        if (levels.isEmpty()) 0f else levels[(frame / perWindow).coerceIn(0, levels.size - 1)]
 
     @Synchronized fun at(frame: Int): Float {
         if (levels.isEmpty()) return 0f

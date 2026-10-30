@@ -188,13 +188,13 @@ object Watches {
             if (hit.once) save(prefs, list - hit)
             hit
         }
-        Log.i("MissMinutes", "Watch matched: ${match.describe()}")
+        PicoLog.i("Watch matched: ${match.describe()}")
         val who = if (sender.isNotEmpty()) "$app message from $sender" else "$app notification"
         Announcer.speak(context, "$who: ${text.take(200)}")
     }
 }
 
-/** Gets a reminder or alert to the user: a notification, and Miss Minutes saying it out loud. */
+/** Gets a reminder or alert to the user: a notification, and Pico saying it out loud. */
 object Announcer {
     private const val CHANNEL = "reminders"
 
@@ -203,7 +203,7 @@ object Announcer {
         val nm = context.getSystemService(NotificationManager::class.java)
         nm.createNotificationChannel(
             NotificationChannel(CHANNEL, "Reminders", NotificationManager.IMPORTANCE_HIGH).apply {
-                description = "Reminders you asked Miss Minutes to set"
+                description = "Reminders you asked your assistant to set"
             }
         )
         val open = PendingIntent.getActivity(
@@ -221,7 +221,7 @@ object Announcer {
             .setColor(Palette.AMBER)
             .setContentTitle(r.text)
             .setContentText("Reminder · $time")
-            .setSubText("Miss Minutes")
+            .setSubText(Prefs(context).assistantName)
             .setStyle(Notification.BigTextStyle().bigText(r.text).setSummaryText("Reminder · $time"))
             .setWhen(r.at)
             .setShowWhen(true)
@@ -239,7 +239,7 @@ object Announcer {
         runCatching { nm.notify(r.id, n) }
     }
 
-    /** Speaks through the running Miss Minutes service. If she's switched off, the notification has to do. */
+    /** Speaks through the running Pico service. If she's switched off, the notification has to do. */
     fun speak(context: Context, text: String) {
         if (!MissMinutesService.running) return
         runCatching {
@@ -247,7 +247,7 @@ object Announcer {
                 MissMinutesService.intent(context, MissMinutesService.ACTION_ANNOUNCE)
                     .putExtra(MissMinutesService.EXTRA_TEXT, text)
             )
-        }.onFailure { Log.w("MissMinutes", "Couldn't announce", it) }
+        }.onFailure { PicoLog.w("Couldn't announce", it) }
     }
 }
 
@@ -279,6 +279,7 @@ class ReminderReceiver : BroadcastReceiver() {
     }
 
     override fun onReceive(context: Context, intent: Intent) {
+        PicoLog.init(context)
         val prefs = Prefs(context)
         when (intent.action) {
             ACTION_FIRE -> Reminders.fire(context, prefs, intent.getIntExtra("id", -1))
@@ -293,7 +294,14 @@ class ReminderReceiver : BroadcastReceiver() {
                     Reminders.add(context, prefs, System.currentTimeMillis() + 10 * 60_000L, text)
                 }
             }
-            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> Reminders.rescheduleAll(context, prefs)
+            Intent.ACTION_BOOT_COMPLETED, Intent.ACTION_MY_PACKAGE_REPLACED -> {
+                Reminders.rescheduleAll(context, prefs)
+                KeepAlive.check(context, prefs, if (intent.action == Intent.ACTION_BOOT_COMPLETED) "phone restarted" else "app updated")
+            }
+            KeepAlive.ACTION_CHECK -> KeepAlive.check(context, prefs, "regular check")
+            ChatForMe.ACTION_STOP -> ChatForMe.stop(context, prefs)
+            // The time they gave is up: switch off and tell them what they missed.
+            Away.ACTION_END -> if (prefs.awayJson.isNotEmpty()) Announcer.speak(context, "Welcome back! " + Away.end(context, prefs))
         }
     }
 }

@@ -26,7 +26,7 @@ import java.util.zip.ZipInputStream
 class WakeWord private constructor(private val model: Model) {
 
     companion object {
-        const val DEFAULT_PHRASE = "hey miss minutes"
+        const val DEFAULT_PHRASE = "hey pico"
         private const val TAG = "MissMinutes"
         private const val MODEL_URL = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
         private const val MODEL_DIR = "vosk-model"
@@ -47,11 +47,14 @@ class WakeWord private constructor(private val model: Model) {
         /** "hey jarvis" becomes "Hey Jarvis", for showing on screen. */
         fun display(phrase: String) = normalize(phrase).split(' ').joinToString(" ") { it.replaceFirstChar(Char::uppercase) }
 
-        /** The part that must be heard: the phrase without a leading "hey" or "ok". */
+        /**
+         * The part that must be heard: the phrase without a leading "hey" or "ok", unless what's left is a short
+         * name like "pico", which on its own would wake her by mistake; then the whole phrase must be heard.
+         */
         fun core(phrase: String): String {
             val words = normalize(phrase).split(' ').filter { it.isNotEmpty() }
             val rest = words.dropWhile { it in GREETINGS }
-            return (rest.ifEmpty { words }).joinToString(" ")
+            return (if (rest.joinToString("").length < 5) words else rest).joinToString(" ")
         }
 
         /** A reason the phrase won't work well, or null if it's fine. */
@@ -62,7 +65,7 @@ class WakeWord private constructor(private val model: Model) {
             val words = phrase.split(' ')
             if (words.size > 5) return "Keep it to five words or fewer."
             if (core(phrase).replace(" ", "").length < 5) {
-                return "That's too short; short words wake her by mistake. Try two words, like Hey Jarvis."
+                return "That's too short; short words cause false wakes. Try two words, like Hey Jarvis."
             }
             return null
         }
@@ -155,7 +158,7 @@ class WakeWord private constructor(private val model: Model) {
             }
             override fun onResult(hypothesis: String?) = check(hypothesis, "text", trigger, minConf)
             override fun onFinalResult(hypothesis: String?) = check(hypothesis, "text", trigger, minConf)
-            override fun onError(e: Exception?) { Log.e(TAG, "Wake word error", e) }
+            override fun onError(e: Exception?) { PicoLog.e("Wake word error", e) }
             override fun onTimeout() {}
         })
     }
@@ -171,7 +174,7 @@ class WakeWord private constructor(private val model: Model) {
         val heard = json.optString(field)
         if (trigger !in heard) return
         if (field == "partial") {
-            Log.i(TAG, "Wake: \"$heard\" (partial) -> yes")
+            PicoLog.i("Wake: \"$heard\" (partial) -> yes")
             onWake()
             return
         }
@@ -182,14 +185,14 @@ class WakeWord private constructor(private val model: Model) {
             want.indices.all { all[i + it].optString("word") == want[it] }
         }
         if (start == null) {
-            Log.i(TAG, "Wake: \"$heard\" without word details -> no")
+            PicoLog.i("Wake: \"$heard\" without word details -> no")
             return
         }
         val match = all.subList(start, start + want.size)
         val conf = match.minOf { it.optDouble("conf", 0.0) }
         val span = match.last().optDouble("end") - match.first().optDouble("start")
         val ok = conf >= minConf && span >= 0.2 * want.size
-        Log.i(TAG, "Wake: \"$heard\" conf=%.2f (needs %.2f) span=%.2fs -> %s".format(conf, minConf, span, if (ok) "yes" else "no"))
+        PicoLog.i("Wake: \"$heard\" conf=%.2f (needs %.2f) span=%.2fs -> %s".format(conf, minConf, span, if (ok) "yes" else "no"))
         if (ok) onWake()
     }
 

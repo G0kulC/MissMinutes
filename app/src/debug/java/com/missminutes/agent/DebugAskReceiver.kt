@@ -5,7 +5,7 @@ import android.content.Context
 import android.content.Intent
 
 /**
- * Debug builds only. Type a request instead of saying it, while Miss Minutes is running:
+ * Debug builds only. Type a request instead of saying it, while Pico is running:
  *   adb shell am broadcast -n com.missminutes.agent/.DebugAskReceiver --es text "what's the weather in Chennai?"
  * Add --es mode announce to test a spoken alert instead.
  */

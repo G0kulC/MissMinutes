@@ -11,7 +11,7 @@ import android.service.notification.StatusBarNotification
 import android.util.Log
 
 /**
- * Collects incoming chat notifications so Miss Minutes can read them out and reply, and checks every new
+ * Collects incoming chat notifications so Pico can read them out and reply, and checks every new
  * notification against the watches the user asked for ("tell me when Ravi messages").
  */
 class NotificationReader : NotificationListenerService() {
@@ -42,6 +42,58 @@ class NotificationReader : NotificationListenerService() {
             "com.facebook.orca" to "Messenger",
             "com.google.android.gm" to "Gmail"
         )
+
+        /** One chat (or missed calls) still waiting in the notification shade: the unread ones. */
+        data class Unread(val app: String, val from: String, val texts: List<String>)
+
+        /** Everything unread right now, newest chats first; null when notification access is off. */
+        fun unread(): List<Unread>? {
+            val service = instance ?: return null
+            val active = runCatching { service.activeNotifications }.getOrNull() ?: return null
+            val out = ArrayList<Unread>()
+            for (sbn in active.sortedByDescending { it.postTime }) {
+                val n = sbn.notification ?: continue
+                if (sbn.packageName == service.packageName || n.flags and Notification.FLAG_GROUP_SUMMARY != 0) continue
+                val extras = n.extras ?: continue
+                val title = (extras.getCharSequence(Notification.EXTRA_CONVERSATION_TITLE)
+                    ?: extras.getCharSequence(Notification.EXTRA_TITLE))?.toString()?.trim().orEmpty()
+                val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
+                    ?.toString()?.trim().orEmpty()
+                val missedCall = n.category == "missed_call" || (title.contains("missed call", ignoreCase = true) &&
+                    (sbn.packageName.contains("dialer") || sbn.packageName.contains("telecom") || sbn.packageName.contains("contacts")))
+                if (missedCall) {
+                    out += Unread("Missed call", if (title.contains("missed", true)) text.ifEmpty { title } else title, emptyList())
+                    continue
+                }
+                val app = CHAT_APPS[sbn.packageName] ?: continue
+                if (title.isEmpty() || SUMMARY.matches(text)) continue
+                // A chat with several messages keeps them all (MessagingStyle); show the last few.
+                @Suppress("DEPRECATION")
+                val bundles = extras.getParcelableArray(Notification.EXTRA_MESSAGES)
+                val texts = bundles?.mapNotNull { (it as? Bundle)?.getCharSequence("text")?.toString() }?.takeLast(3)
+                    ?.takeIf { it.isNotEmpty() } ?: listOf(text).filter { it.isNotEmpty() }
+                if (texts.isEmpty() || title.equals("You", true)) continue
+                out += Unread(app, title, texts)
+            }
+            return out
+        }
+
+        /** "Unread: WhatsApp, Ravi (3): “…”; Missed calls: Amma." in words for the assistant to read out. */
+        fun describeUnread(list: List<Unread>?): String {
+            if (list == null) return "Notification access is off, so unread messages can't be read. The user can allow it in the app's Settings, Permissions."
+            if (list.isEmpty()) return "Nothing unread: no new messages or missed calls."
+            val calls = list.filter { it.app == "Missed call" }.groupingBy { it.from }.eachCount()
+            val chats = list.filter { it.app != "Missed call" }.take(8)
+            return buildString {
+                if (chats.isNotEmpty()) {
+                    append("Unread messages: ")
+                    append(chats.joinToString("; ") { u -> "${u.from} on ${u.app}: " + u.texts.joinToString(" / ") { "“${it.take(120)}”" } })
+                    if (list.count { it.app != "Missed call" } > chats.size) append("; and more")
+                    append(". ")
+                }
+                if (calls.isNotEmpty()) append("Missed calls: " + calls.entries.joinToString { (who, n) -> if (n > 1) "$who ($n)" else who } + ".")
+            }.trim()
+        }
 
         fun recent(from: String?, limit: Int): List<Message> = synchronized(lock) {
             messages.asReversed()
@@ -89,7 +141,7 @@ class NotificationReader : NotificationListenerService() {
     override fun onNotificationPosted(sbn: StatusBarNotification?) {
         sbn ?: return
         capture(sbn)
-        runCatching { watch(sbn) }.onFailure { Log.w("MissMinutes", "Notification watch failed", it) }
+        runCatching { watch(sbn) }.onFailure { PicoLog.w("Notification watch failed", it) }
     }
 
     private val prefs by lazy { Prefs(this) }
@@ -120,7 +172,15 @@ class NotificationReader : NotificationListenerService() {
         val text = (extras.getCharSequence(Notification.EXTRA_BIG_TEXT) ?: extras.getCharSequence(Notification.EXTRA_TEXT))
             ?.toString()?.trim().orEmpty()
         if (sender.isEmpty() || text.isEmpty() || SUMMARY.matches(text)) return
+        // After a reply (yours, or the assistant's), WhatsApp posts the chat again as "You: …": that's not a new message.
+        if (sender.equals("You", ignoreCase = true) || sender.endsWith(": You")) return
         val reply = n.actions?.firstOrNull { !it.remoteInputs.isNullOrEmpty() }
-        add(Message(sbn.key, app, sender, text, sbn.postTime, reply))
+        val message = Message(sbn.key, app, sender, text, sbn.postTime, reply)
+        add(message)
+        // Not-available mode notes it and may answer once; a group chat is never answered.
+        val group = extras.getBoolean(Notification.EXTRA_IS_GROUP_CONVERSATION) || sender.contains(": ")
+        // The chat the assistant is keeping going comes first; Not-available mode handles the rest.
+        val handled = runCatching { ChatForMe.onMessage(this, prefs, message, group) }.onFailure { PicoLog.w("Chat for me failed", it) }.getOrDefault(false)
+        if (!handled) runCatching { Away.onMessage(this, prefs, message, group) }.onFailure { PicoLog.w("Away message failed", it) }
     }
 }

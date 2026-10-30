@@ -27,25 +27,48 @@ import kotlin.math.max
 import kotlin.math.min
 
 /**
- * What you see when you wake Miss Minutes: the little ghost at the bottom of the screen, whose mood follows
+ * What you see when you wake Pico: the little ghost at the bottom of the screen, whose mood follows
  * what she's doing (listening, thinking, typing in your apps, speaking, happy when it worked, sad when it failed). Tap it to skip her speaking or stop; swipe it down to close.
- * When she asks you something, a panel slides up above the orb with her question, Yes / Cancel buttons
- * for confirmations, and a short hint underneath.
+ * When she asks you something, the cloud popup ([CloudPanel]) appears in the middle of the screen with Pico peeking
+ * over it, her question, Yes / Cancel for confirmations, and a voice hint; it stays to show the outcome.
  */
 class OverlayManager(private val context: Context, private val prefs: Prefs) {
     private val wm = context.getSystemService(WindowManager::class.java)
     private val motion = ValueAnimator.areAnimatorsEnabled()
 
     private var orb: FrameLayout? = null
+    private var orbParams: WindowManager.LayoutParams? = null
+    private var orbDisc: View? = null
     @Volatile private var dial: GhostView? = null
     private var edge: EdgeGlowView? = null
-    private var panel: LinearLayout? = null
+    private var cloud: CloudPanel? = null
     private var activity: String? = null
 
     var state = OrbState.IDLE
         private set
+    /** The ghost's colour: the assistant's, or the agent's own while it talks. */
+    var ghostTheme: GhostTheme = GhostTheme.of(prefs.ghostTheme)
+        set(value) {
+            field = value
+            dial?.theme = value
+            cloud?.ghost?.theme = value
+        }
+    /** The name on the popup and in screen-reader messages: the assistant's, or the agent talking now. */
+    var speakerName: String = prefs.assistantName
     var onTap: (() -> Unit)? = null
     var onDismiss: (() -> Unit)? = null
+    /** A tap on the Pico Camera button beside the ghost. */
+    var onCamera: (() -> Unit)? = null
+    private var cameraButton: View? = null
+    /** While the camera window is open the ghost sits in its corner, so the floating one and its button step aside. */
+    var docked = false
+        set(value) {
+            field = value
+            PicoLog.i("Ghost ${if (value) "moved into the camera window" else "back on screen"} (orb ${if (orb == null) "not shown" else "shown"})")
+            val show = if (value) View.INVISIBLE else View.VISIBLE
+            orb?.visibility = show
+            cameraButton?.visibility = show
+        }
     /** A Yes (true) or Cancel (false) tap on the confirmation panel. */
     var onAnswer: ((Boolean) -> Unit)? = null
 
@@ -54,7 +77,16 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
     fun canShow() = Settings.canDrawOverlays(context)
 
     private val orbSize get() = context.dpi(ORB_DP)
-    private val orbLift get() = context.dpi(28)
+    /**
+     * Distance from the bottom of the screen to the orb: its centre sits [ORB_CENTER] of the way down, clear of
+     * the keyboard and the apps' own bottom bars (it used to hug the bottom edge, which felt too low).
+     */
+    private val orbLift: Int get() {
+        // The whole screen, system bars included: displayMetrics leaves them out, which put the orb ~2% too high.
+        val height = if (Build.VERSION.SDK_INT >= 30) wm.maximumWindowMetrics.bounds.height()
+                     else context.resources.displayMetrics.heightPixels
+        return ((height * (1f - ORB_CENTER)) - orbSize / 2f).toInt().coerceAtLeast(context.dpi(28))
+    }
 
     // ---------- The orb ----------
 
@@ -62,7 +94,7 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
         if (orb != null || !canShow()) return
         if (prefs.edgeGlow) addEdgeGlow()
 
-        val dialView = GhostView(context)
+        val dialView = GhostView(context).apply { theme = ghostTheme }
         val disc = View(context).apply {
             background = GradientDrawable().apply {
                 shape = GradientDrawable.OVAL
@@ -91,10 +123,12 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
             removeEdgeGlow()
             return
         }
-        orb = orbView; dial = dialView
+        orb = orbView; dial = dialView; orbParams = params; orbDisc = disc
         installTouch(orbView)
         dialView.start(withIntro = true)
         describe()
+        addCameraButton()
+        if (docked) { orbView.visibility = View.INVISIBLE; cameraButton?.visibility = View.INVISIBLE }
 
         if (motion) {
             orbView.alpha = 0f
@@ -107,9 +141,23 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
     }
 
     fun setState(s: OrbState) {
+        when (s) {
+            OrbState.LISTENING -> PicoCamera.onCaption?.invoke("Listening…")
+            OrbState.THINKING -> PicoCamera.onCaption?.invoke("Thinking…")
+            else -> {}
+        }
         if (s != OrbState.THINKING) activity = null
         state = s
-        dial?.state = s
+        ghosts().forEach { it.state = s }
+        fitOrb()
+        cloud?.let { c ->
+            when {
+                // She answered without doing anything ("okay, I won't send it"): the cloud contracts away.
+                s == OrbState.SPEAKING && c.phase == CloudPanel.Phase.PROCESSING -> hidePanel()
+                s == OrbState.LISTENING && c.phase == CloudPanel.Phase.WAITING -> c.setPhase(CloudPanel.Phase.LISTENING)
+                s == OrbState.SPEAKING && c.phase == CloudPanel.Phase.LISTENING -> c.setPhase(CloudPanel.Phase.WAITING)
+            }
+        }
         describe()
         edge?.let { glow ->
             val on = s == OrbState.THINKING
@@ -122,6 +170,7 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
     /** Safe to call from any thread: it only stores a number the views read each frame. */
     fun setLevel(v: Float) {
         dial?.setLevel(v)
+        cloud?.setLevel(v)
     }
 
     /** What she's doing right now ("Opening WhatsApp"), read out by TalkBack instead of shown on screen. */
@@ -130,22 +179,65 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
         describe()
     }
 
-    /** A tool started: work inside your apps shows the ghost typing on her laptop. */
+    /**
+     * While she's thinking, her thought cloud ("Hmm... Let's see...") shares the orb with her, so the orb grows
+     * enough for its words to be read, keeping the same centre; it's back to normal size for everything else.
+     */
+    private fun fitOrb() {
+        val view = orb ?: return
+        val params = orbParams ?: return
+        val ghost = dial ?: return
+        val thinking = state == OrbState.THINKING && ghost.thinkingMood == Mood.THINKING && cloud == null
+        val size = if (thinking) context.dpi(THINKING_DP) else orbSize
+        // The dark disc frames her alone; with the thought cloud beside her it would sit off-centre, so it fades out.
+        orbDisc?.animate()?.alpha(if (thinking) 0f else 1f)?.setDuration(160)?.start()
+        if (params.width == size) return
+        params.width = size
+        params.height = size
+        params.y = orbLift - (size - orbSize) / 2
+        ghost.layoutParams = (ghost.layoutParams as FrameLayout.LayoutParams).apply { width = size; height = size }
+        runCatching { wm.updateViewLayout(view, params) }
+    }
+
+    /** A tool started: her thinking face shows what kind of work it is. */
     fun toolStarted(name: String) {
-        dial?.inApps = name in APP_TOOLS
+        val mood = when (name) {
+            "web_search", "get_weather", "daily_briefing", "whats_new", "list_alarms", "shop_search" -> Mood.SEARCHING
+            in APP_TOOLS -> Mood.WORKING
+            else -> Mood.THINKING
+        }
+        ghosts().forEach { it.thinkingMood = mood }
+        fitOrb()
+    }
+
+    /** The feeling of the reply she's about to speak ([Mood.ofTag]); null is her normal speaking face. */
+    fun setEmotion(mood: Mood?) {
+        ghosts().forEach { it.emotion = mood }
     }
 
     /** A tool finished: a quick happy face when an action worked, a frown when it failed. Lookups stay quiet. */
     fun toolEnded(name: String, ok: Boolean) {
+        // A confirmed action finishing shows its outcome in the cloud, which then closes by itself.
+        cloud?.takeIf { it.phase == CloudPanel.Phase.PROCESSING }?.let { c ->
+            c.setPhase(if (ok) CloudPanel.Phase.SUCCESS else CloudPanel.Phase.ERROR)
+            c.postDelayed({ if (cloud === c) hidePanel() }, if (ok) 1400 else 2400)
+        }
         when {
-            !ok -> dial?.flash(Mood.ERROR, 1800)
-            name in ACTION_TOOLS -> dial?.flash(Mood.SUCCESS, 1400)
+            !ok -> {
+                dial?.flash(Mood.ERROR, 1800)
+                orb?.announceForAccessibility("$speakerName needs your attention.")
+            }
+            name in MEDIA_TOOLS -> dial?.flash(Mood.PLAYING, 1800)
+            name in ACTION_TOOLS -> {
+                dial?.flash(Mood.SUCCESS, 1400)
+                orb?.announceForAccessibility("$speakerName got it done!")
+            }
         }
     }
 
     /** Shows a one-off mood for a moment (a reminder or alert arriving). */
     fun flash(mood: Mood, ms: Long = 1600) {
-        dial?.flash(mood, ms)
+        ghosts().forEach { it.flash(mood, ms) }
     }
 
     private fun describe() {
@@ -153,167 +245,121 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
         val what = when (state) {
             OrbState.IDLE -> "ready"
             OrbState.LISTENING -> "listening"
-            OrbState.THINKING -> activity?.let { "working: $it" } ?: "working"
+            OrbState.THINKING -> activity?.let { "working on it: $it" } ?: "working on it"
             OrbState.SPEAKING -> "speaking"
         }
         val action = if (state == OrbState.SPEAKING) "Double-tap to skip" else "Double-tap to stop"
-        view.contentDescription = "Miss Minutes, $what. $action, swipe down to close."
+        view.contentDescription = "$speakerName, $what. $action, swipe down to close."
     }
 
     // ---------- The panel ----------
 
-    /** Shows her question (or a problem) above the orb. Calling it again swaps the text in place. */
+    /**
+     * Shows her question (or a problem) in the cloud popup ([CloudPanel]), centred on screen. While it's up the
+     * small orb steps aside: Pico is peeking over the cloud instead. Calling it again replaces the cloud.
+     */
     fun showPanel(message: String, kind: PanelKind) {
         if (orb == null || !canShow()) return
-        hidePanel(animated = false)
-        if (kind == PanelKind.PROBLEM) dial?.flash(Mood.ERROR, 3000)
+        removeCloud()
+        dial?.waitingAnswer = kind == PanelKind.CONFIRM // her waiting face while she listens for your yes
 
-        val accent = when (kind) {
-            PanelKind.CONFIRM -> Palette.AMBER
-            PanelKind.QUESTION -> Palette.AMBER
-            PanelKind.PROBLEM -> Palette.CORAL
-        }
-        val dot = View(context).apply {
-            background = GradientDrawable().apply { shape = GradientDrawable.OVAL; setColor(accent) }
-            importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
-        }
-        val label = TextView(context).apply {
-            text = when (kind) {
-                PanelKind.CONFIRM -> "Confirm"
-                PanelKind.QUESTION -> "Miss Minutes asks"
-                PanelKind.PROBLEM -> "Something went wrong"
-            }
-            textSize = 13f
-            letterSpacing = 0.04f
-            typeface = Fonts.get(context, Fonts.SEMIBOLD)
-            setTextColor(accent)
-        }
-        val header = LinearLayout(context).apply {
-            orientation = LinearLayout.HORIZONTAL
-            gravity = Gravity.CENTER_VERTICAL
-            addView(dot, LinearLayout.LayoutParams(context.dpi(8), context.dpi(8)).apply { marginEnd = context.dpi(8) })
-            addView(label)
-        }
-        val body = TextView(context).apply {
-            text = message
-            textSize = 18f
-            typeface = Fonts.get(context, Fonts.REGULAR)
-            setTextColor(Palette.CREAM)
-            setLineSpacing(0f, 1.2f)
-            maxLines = 8
-            ellipsize = TextUtils.TruncateAt.END
-            accessibilityLiveRegion = View.ACCESSIBILITY_LIVE_REGION_POLITE
-        }
-        val card = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            setPadding(context.dpi(20), context.dpi(16), context.dpi(20), context.dpi(16))
-            background = GradientDrawable().apply {
-                cornerRadius = context.dp(24f)
-                setColor(Palette.alpha(Palette.DIAL, 250))
-                setStroke(context.dpi(1), Palette.alpha(Palette.CREAM, 24))
-            }
-            elevation = context.dp(10f)
-            addView(header)
-            addView(body, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = context.dpi(8) })
-            if (kind == PanelKind.CONFIRM) {
-                val buttons = LinearLayout(context).apply {
-                    orientation = LinearLayout.HORIZONTAL
-                    addView(button("Cancel", filled = false) { onAnswer?.invoke(false) },
-                        LinearLayout.LayoutParams(0, context.dpi(48), 1f).apply { marginEnd = context.dpi(10) })
-                    addView(button("Yes", filled = true) { onAnswer?.invoke(true) },
-                        LinearLayout.LayoutParams(0, context.dpi(48), 1f))
-                }
-                addView(buttons, LinearLayout.LayoutParams(
-                    LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-                ).apply { topMargin = context.dpi(16) })
-            }
-        }
-        val hint = TextView(context).apply {
-            text = when (kind) {
-                PanelKind.CONFIRM -> "Say “yes” or “no”, or tap a button"
-                PanelKind.QUESTION -> "Just answer out loud · tap the orb to stop"
-                PanelKind.PROBLEM -> "Tap the orb to close"
-            }
-            textSize = 13f
-            typeface = Fonts.get(context, Fonts.MEDIUM)
-            setTextColor(Palette.CREAM)
-            gravity = Gravity.CENTER
-            setPadding(context.dpi(14), context.dpi(6), context.dpi(14), context.dpi(6))
-            background = GradientDrawable().apply {
-                cornerRadius = context.dp(99f)
-                setColor(Palette.alpha(Palette.INK, 214)) // readable over any app behind it
-            }
-        }
-        val column = LinearLayout(context).apply {
-            orientation = LinearLayout.VERTICAL
-            gravity = Gravity.CENTER_HORIZONTAL
-            clipToPadding = false
-            setPadding(context.dpi(6), context.dpi(6), context.dpi(6), context.dpi(4))
-            addView(card, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ))
-            addView(hint, LinearLayout.LayoutParams(
-                LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT
-            ).apply { topMargin = context.dpi(10) })
-        }
-
-        val width = min((context.resources.displayMetrics.widthPixels * 0.92f).toInt(), context.dpi(440))
+        val view = CloudPanel(context, ghostTheme, kind, message, speakerName,
+            onAnswer = { yes -> onAnswer?.invoke(yes) },
+            onGhostTap = { onTap?.invoke() })
+        view.ghost.state = state
+        // Compact, and where Pico already is: just above the orb's spot, with even side margins on any screen.
+        val width = min(context.resources.displayMetrics.widthPixels - context.dpi(48), context.dpi(340))
         val params = overlayParams(width, WindowManager.LayoutParams.WRAP_CONTENT).apply {
             gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
-            y = orbLift + orbSize + context.dpi(4)
+            y = orbLift
         }
-        if (runCatching { wm.addView(column, params) }.isFailure) return
-        panel = column
+        val added = runCatching { wm.addView(view, params) }
+        if (added.isFailure) {
+            PicoLog.w("Cloud popup couldn't be shown", added.exceptionOrNull())
+            return
+        }
+        PicoLog.i("Cloud: $kind \"$message\"")
+        cloud = view
+        view.enter()
+        orb?.let { o -> o.animate().cancel(); o.animate().alpha(0f).setDuration(160).withEndAction { o.visibility = View.INVISIBLE }.start() }
+    }
 
-        if (motion) {
-            column.alpha = 0f
-            column.translationY = context.dp(18f)
-            column.scaleX = 0.97f
-            column.scaleY = 0.97f
-            column.animate().alpha(1f).translationY(0f).scaleX(1f).scaleY(1f)
-                .setInterpolator(DecelerateInterpolator(2f)).setDuration(260).start()
+    /**
+     * You've answered. A confirmation stays up to show the outcome (working, then done or a problem); a plain
+     * question just goes away.
+     */
+    fun answerHeard() {
+        val c = cloud ?: return
+        if (c.phase == CloudPanel.Phase.WAITING || c.phase == CloudPanel.Phase.LISTENING) {
+            if (c.ghost.waitingAnswer) c.setPhase(CloudPanel.Phase.PROCESSING) else hidePanel()
         }
     }
 
     fun hidePanel(animated: Boolean = true) {
-        val view = panel ?: return
-        panel = null
-        if (motion && animated) {
-            view.animate().alpha(0f).translationY(context.dp(10f)).setInterpolator(AccelerateInterpolator())
-                .setDuration(150).withEndAction { runCatching { wm.removeView(view) } }.start()
-        } else {
-            runCatching { wm.removeView(view) }
+        dial?.waitingAnswer = false
+        val view = cloud ?: return
+        cloud = null
+        val gone = { runCatching { wm.removeView(view) }; Unit }
+        if (animated) view.dismiss(gone) else gone()
+        orb?.let { o ->
+            o.visibility = View.VISIBLE
+            o.animate().cancel()
+            if (motion && animated) o.animate().alpha(1f).setStartDelay(120).setDuration(200).start() else o.alpha = 1f
         }
     }
 
-    private fun button(text: String, filled: Boolean, onClick: () -> Unit) = Button(context).apply {
-        this.text = text
-        isAllCaps = false
-        textSize = 16f
-        typeface = Fonts.get(context, Fonts.SEMIBOLD)
-        stateListAnimator = null
-        minHeight = context.dpi(48)
-        minimumHeight = context.dpi(48)
-        setPadding(context.dpi(12), 0, context.dpi(12), 0)
-        setTextColor(if (filled) Palette.INK else Palette.CREAM)
-        val shape = GradientDrawable().apply {
-            cornerRadius = context.dp(99f)
-            if (filled) setColor(Palette.AMBER)
-            else { setColor(Palette.alpha(Palette.CREAM, 10)); setStroke(context.dpi(1), Palette.alpha(Palette.CREAM, 70)) }
+    private fun removeCloud() {
+        val view = cloud ?: return
+        cloud = null
+        runCatching { wm.removeView(view) }
+    }
+
+    /** Both Picos: the orb's, and the one peeking over the cloud while it's up. */
+    private fun ghosts() = listOfNotNull(dial, cloud?.ghost, PicoCamera.ghost)
+
+    /** The round Pico Camera button just right of the ghost: a tap opens the camera window. */
+    private fun addCameraButton() {
+        if (cameraButton != null) return
+        val size = context.dpi(48)
+        val button = android.widget.ImageView(context).apply {
+            setImageResource(R.drawable.ic_pico_camera)
+            setPadding(context.dpi(9), context.dpi(9), context.dpi(9), context.dpi(9))
+            background = GradientDrawable().apply {
+                shape = GradientDrawable.OVAL
+                setColor(Palette.alpha(Palette.INK, 236))
+                setStroke(context.dpi(1), Palette.alpha(Palette.AMBER, 120))
+            }
+            elevation = context.dp(6f)
+            contentDescription = "Pico Camera: show me something and ask about it"
+            setOnClickListener { onCamera?.invoke() }
         }
-        val ripple = if (filled) Palette.alpha(Palette.INK, 60) else Palette.alpha(Palette.CREAM, 50)
-        background = RippleDrawable(ColorStateList.valueOf(ripple), shape, null)
-        setOnClickListener { onClick() }
+        val params = overlayParams(size, size).apply {
+            gravity = Gravity.BOTTOM or Gravity.CENTER_HORIZONTAL
+            x = orbSize / 2 + context.dpi(30) // to the right of the ghost
+            y = orbLift + (orbSize - size) / 2
+        }
+        if (runCatching { wm.addView(button, params) }.isFailure) return
+        cameraButton = button
+        // The first few times, say once what the little button is for.
+        if (prefs.cameraHintShown < 2) {
+            prefs.cameraHintShown = prefs.cameraHintShown + 1
+            android.widget.Toast.makeText(context, "Tip: tap the camera button to show ${prefs.assistantName} something", android.widget.Toast.LENGTH_LONG).show()
+        }
+        if (motion) {
+            button.alpha = 0f; button.scaleX = 0.4f; button.scaleY = 0.4f
+            button.animate().alpha(1f).scaleX(1f).scaleY(1f).setStartDelay(220).setInterpolator(OvershootInterpolator(1.6f)).setDuration(300).start()
+        }
     }
 
     // ---------- Hide everything ----------
 
     fun hide() {
         hidePanel()
+        cameraButton?.let { b -> cameraButton = null; runCatching { wm.removeView(b) } }
         val view = orb
         orb = null
+        orbParams = null
+        orbDisc = null
         dial?.stop()
         dial = null
         activity = null
@@ -416,17 +462,26 @@ class OverlayManager(private val context: Context, private val prefs: Prefs) {
 
     companion object {
         private const val ORB_DP = 112
+        /** The orb while her thought cloud shows, big enough to read "Hmm... Let's see...". */
+        private const val THINKING_DP = 156
+        /**
+         * Where the orb's centre is aimed, as a fraction of the screen height from the top. Overlays are placed
+         * above the navigation bar, so it lands at about 76% (checked on screen), inside the 75-78% asked for.
+         */
+        private const val ORB_CENTER = 0.78f
         /** Tools that work inside other apps on screen. */
         private val APP_TOOLS = setOf(
             "read_screen", "tap_text", "type_text", "scroll", "open_app", "play_on_youtube", "phone_navigation",
-            "send_whatsapp_message",
+            "send_whatsapp_message", "quick_setting", "open_settings", "draft_email", "list_alarms", "alarm_switch",
         )
-        /** Tools that change something, worth a happy face when they work. */
-        private val ACTION_TOOLS = setOf(
+        /** Tools that start music or videos: her playing face. */
+        private val MEDIA_TOOLS = setOf("media_control", "play_on_youtube", "play_music")
+        /** Tools that change something, worth a happy face (and the success sound) when they work. */
+        val ACTION_TOOLS = setOf(
             "send_whatsapp_message", "send_sms", "call_contact", "reply_to_message", "set_alarm", "set_timer",
             "flashlight", "set_volume", "set_brightness", "sound_mode", "media_control", "add_calendar_event",
             "set_reminder", "cancel_reminder", "watch_notifications", "stop_watching", "remember", "forget",
-            "save_routine", "delete_routine",
+            "save_routine", "delete_routine", "quick_setting", "alarm_switch",
         )
     }
 }

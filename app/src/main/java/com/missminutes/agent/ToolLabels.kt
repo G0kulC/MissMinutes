@@ -25,6 +25,19 @@ object ToolLabels {
                 "lock_screen" -> "Locking the screen"
                 else -> "Navigating"
             }
+            "whats_new" -> "Checking what you missed"
+            "daily_briefing" -> "Your morning briefing"
+            "open_camera" -> "Opening Pico Camera"
+            "close_camera" -> "Closing the camera"
+            "shop_search" -> "Google: ${s("query")}"
+            "chat_for_me" -> if (input.optBoolean("stop")) "Stopping the chat" else "Chatting with ${s("contact")}"
+            "set_away" -> "Not available mode"
+            "end_away" -> "Welcome back"
+            "away_status" -> "What you missed"
+            "list_alarms" -> "Checking your alarms"
+            "alarm_switch" -> "Alarm %d:%02d %s".format(input.optInt("hour"), input.optInt("minute"), if (input.optBoolean("on")) "on" else "off")
+            "play_music" -> if (s("query").isNotEmpty()) "Playing ${s("query")}" else "Playing music"
+            "get_weather" -> if (s("place").isNotEmpty()) "Weather in ${s("place")}" else "Checking the weather"
             "read_screen" -> "Looking at the screen"
             "tap_text" -> "Tapping ${s("text")}"
             "type_text" -> "Typing"
@@ -43,6 +56,10 @@ object ToolLabels {
                 input.has("percent") -> "Brightness ${input.optInt("percent")}%"
                 else -> if (input.optBoolean("auto")) "Auto brightness" else "Brightness"
             }
+            "quick_setting" -> s("tile").replace('_', ' ').replaceFirstChar(Char::uppercase) +
+                if (!input.has("on")) "" else if (input.optBoolean("on")) " on" else " off"
+            "open_settings" -> "Opening ${s("page").replace('_', ' ')} settings"
+            "draft_email" -> "Drafting an email"
             "sound_mode" -> when (s("mode")) {
                 "normal" -> "Ringer on"
                 "vibrate" -> "Vibrate mode"
@@ -64,7 +81,6 @@ object ToolLabels {
             "cancel_reminder" -> "Cancelling reminder"
             "watch_notifications" -> if (s("from").isNotEmpty()) "Watching for ${s("from")}" else "Watching notifications"
             "stop_watching" -> "Stopping alerts"
-            "think_deeper" -> "Thinking it through"
             "web_search" -> if (s("query").isNotEmpty()) "Searching: ${s("query")}" else "Searching the web"
             else -> name.replace('_', ' ')
         }

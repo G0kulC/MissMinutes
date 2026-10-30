@@ -1,6 +1,7 @@
 """
-Builds Miss Minutes' ghost as Lottie animations, one file per emotion, into app/src/main/assets/ghost/.
-Run: python -I tools/ghost_lottie.py   (from the MissMinutes folder). Edit shapes or timings here, then re-run.
+The first version of Pico's ghost, drawn as Lottie animations. The app now plays the designed animations in
+app/src/main/assets/pico/ (from lottie_animations/); this file is kept because ghost_icons.py draws the app and
+notification icons from its body_path(). Running it writes the old moods to app/src/main/assets/ghost/ (unused).
 
 Canvas 200x200 at 30 fps. Layers are listed top first; inside a group, shapes listed first draw on top.
 """

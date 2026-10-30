@@ -1,6 +1,6 @@
-# Miss Minutes 2.1 (Pro)
+# Pico (Pro)
 
-Your personal Android voice agent. Say the wake word, an animated minute-dial orb appears at the bottom of
+Your personal Android voice agent. Say "Hey Pico", Pico the little ghost appears at the bottom of
 the screen, you speak Tamil, English or Tanglish, and she does it on your phone and answers out loud.
 
 ## Speed update

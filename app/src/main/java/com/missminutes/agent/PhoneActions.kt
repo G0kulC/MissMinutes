@@ -3,6 +3,7 @@ package com.missminutes.agent
 import android.Manifest
 import android.accessibilityservice.AccessibilityService
 import android.content.Context
+import android.content.ActivityNotFoundException
 import android.content.Intent
 import android.content.pm.PackageManager
 import android.hardware.camera2.CameraCharacteristics
@@ -14,6 +15,7 @@ import android.net.Uri
 import android.os.BatteryManager
 import android.os.Build
 import android.provider.AlarmClock
+import android.provider.ContactsContract.CommonDataKinds.Email
 import android.provider.ContactsContract.CommonDataKinds.Phone
 import android.telephony.SmsManager
 import android.view.KeyEvent
@@ -31,11 +33,17 @@ import kotlin.math.pow
 import kotlin.math.roundToInt
 import kotlin.math.sqrt
 
-/** Everything Miss Minutes can do on the phone. To add a power: add a case here and a tool in ClaudeBrain. */
+/** Everything Pico can do on the phone. To add a power: add a case here and a tool in ClaudeBrain. */
 class PhoneActions(private val context: Context, private val prefs: Prefs) {
 
     /** Set when she should stay quiet afterwards (for example, a call just started). */
+    /** For starting the camera window from the assistant. */
+    val appContext: Context get() = context.applicationContext
     var quietAfterAction = false
+    /** Music started: say the one line, then stop listening (the mic would hear the song's lyrics as requests). */
+    var endAfterReply = false
+    /** Music was started this conversation: make sure it's still playing once she has finished talking. */
+    var musicStarted = false
 
     suspend fun run(name: String, input: JSONObject): String = when (name) {
         "send_whatsapp_message" -> sendWhatsApp(input.text("contact_name"), input.text("message"))
@@ -45,16 +53,43 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         "reply_to_message" -> replyToMessage(input.text("sender"), input.text("message"))
         "open_app" -> openApp(input.text("app_name"))
         "play_on_youtube" -> playOnYoutube(input.text("query"))
-        "set_alarm" -> setAlarm(input.getInt("hour"), input.getInt("minute"), input.text("label").ifEmpty { "Miss Minutes" })
-        "set_timer" -> setTimer(input.optInt("minutes", 0), input.optInt("seconds", 0), input.text("label").ifEmpty { "Miss Minutes" })
+        "play_music" -> playMusic(input.text("query"))
+        "list_alarms" -> listAlarms()
+        "alarm_switch" -> switchAlarm(input.getInt("hour"), input.optInt("minute", 0), input.optBoolean("on", false),
+            input.optBoolean("today_only", true))
+        "set_alarm" -> setAlarm(input.getInt("hour"), input.getInt("minute"), input.text("label").ifEmpty { prefs.assistantName })
+        "set_timer" -> setTimer(input.optInt("minutes", 0), input.optInt("seconds", 0), input.text("label").ifEmpty { prefs.assistantName })
         "phone_navigation" -> navigate(input.text("action"))
         "read_screen" -> screen()?.readScreen() ?: ACCESSIBILITY_OFF
         "tap_text" -> screen()?.tapText(input.text("text")) ?: ACCESSIBILITY_OFF
         "type_text" -> screen()?.typeText(input.text("text"), input.optBoolean("press_enter", false)) ?: ACCESSIBILITY_OFF
         "scroll" -> screen()?.scroll(input.text("direction")) ?: ACCESSIBILITY_OFF
+        "whats_new" -> NotificationReader.describeUnread(NotificationReader.unread()) +
+            (Away.state(prefs)?.let { " " + Away.summary(it, Away.events(prefs), System.currentTimeMillis()) } ?: "")
+        "daily_briefing" -> briefing()
+        "open_camera" -> {
+            PicoCamera.openWindow(context, front = input.optBoolean("front", false), fromVoice = true)
+            "The camera window is open (${if (input.optBoolean("front", false)) "front" else "back"} camera). From the next message, each one comes with a photo of what it sees."
+        }
+        "close_camera" -> if (PicoCamera.open) { context.startActivity(Intent(context, CameraActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("close", true)); "Closed the camera." } else "The camera wasn't open."
+        "shop_search" -> shopOnGoogle(input.text("query"))
+        "chat_for_me" -> if (input.optBoolean("stop", false)) ChatForMe.stop(context, prefs)
+            else ChatForMe.start(context, prefs, input.text("contact"), input.text("app"))
+        "set_away" -> setAway(input)
+        "end_away" -> if (Away.state(prefs) == null) "Not-available mode wasn't on." else Away.end(context, prefs)
+        "away_status" -> Away.state(prefs)?.let {
+            "Not available (${it.reason})" + (if (it.until > 0) " until ${Away.clock(it.until)}" else " until the user says they're back") +
+                ". So far: " + Away.summary(it, Away.events(prefs), System.currentTimeMillis())
+        } ?: ("Not-available mode is off. Last time: " + Away.summary(null, Away.events(prefs), System.currentTimeMillis()))
+        "get_weather" -> Weather.get(context, prefs, input.text("place"), input.optInt("days", 1))
         "flashlight" -> flashlight(input.optBoolean("on", true))
         "set_volume" -> setVolume(input)
         "set_brightness" -> setBrightness(input)
+        "quick_setting" -> screen()?.quickSetting(input.text("tile"), if (input.has("on")) input.optBoolean("on") else null)
+            ?: ACCESSIBILITY_OFF
+        "open_settings" -> openSettings(input.text("page"), input.text("app"))
+        "draft_email" -> draftEmail(input.text("to"), input.text("subject"), input.text("body"))
         "sound_mode" -> soundMode(input.text("mode"), input.optInt("minutes", 0))
         "directions" -> directions(input.text("destination"), input.text("mode"), input.optBoolean("start", false))
         "read_calendar" -> readCalendar(input.text("date"), input.optInt("days", 1))
@@ -148,17 +183,13 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         else "Opened ${contact.name}'s chat with the message typed, but couldn't press Send automatically."
     }
 
-    private fun sendSms(contactName: String, message: String): String {
+    private suspend fun sendSms(contactName: String, message: String): String {
         if (message.isBlank()) return "ERROR: the message is empty"
         val contact = findContact(contactName) ?: return "ERROR: no contact named '$contactName' in the phone"
         if (!granted(Manifest.permission.SEND_SMS)) return "ERROR: SMS permission is off"
-        val sms: SmsManager = if (Build.VERSION.SDK_INT >= 31) {
-            context.getSystemService(SmsManager::class.java)
-        } else {
-            @Suppress("DEPRECATION") SmsManager.getDefault()
-        }
-        sms.sendMultipartTextMessage(contact.number, null, sms.divideMessage(message), null, null)
-        return "SMS sent to ${contact.name}."
+        // Only "sent" once the phone confirms it.
+        return Sms.send(context, contact.number, message)?.let { "ERROR: the SMS to ${contact.name} wasn't sent: $it." }
+            ?: "SMS sent to ${contact.name}."
     }
 
     private fun call(contactName: String): String {
@@ -234,6 +265,133 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         start(intent)
         return "Showing YouTube results for \"$query\". To play one, use read_screen and then tap_text on its title."
     }
+
+    /**
+     * Starts music playing straight away (Android's "play from search", which YouTube Music, Spotify and most music
+     * apps answer): a song, artist, mood ("Tamil morning songs") or nothing at all for "play something".
+     */
+    private suspend fun playMusic(query: String): String {
+        val ytMusic = "com.google.android.apps.youtube.music"
+        if (query.isBlank()) {
+            // "Play something": carry on with the last song.
+            context.getSystemService(AudioManager::class.java).apply {
+                dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY))
+                dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY))
+            }
+            return nowPlaying(null, 3000)?.let { endAfterReply = true; musicStarted = true; "Now playing $it." }
+                ?: "ERROR: nothing started playing. Ask what they'd like to hear."
+        }
+        if (!installed(ytMusic)) return playOnYoutube(query)
+        val intent = Intent(android.provider.MediaStore.INTENT_ACTION_MEDIA_PLAY_FROM_SEARCH).apply {
+            putExtra(android.app.SearchManager.QUERY, query)
+            putExtra(android.provider.MediaStore.EXTRA_MEDIA_FOCUS, "vnd.android.cursor.item/*")
+            setPackage(ytMusic)
+        }
+        // The song loaded before (playing or paused): only a different one counts as the new music starting.
+        val before = currentTitle(ytMusic)
+        try { start(intent) } catch (e: ActivityNotFoundException) { return playOnYoutube(query) }
+        // Some versions start playing by themselves; YouTube Music on this phone only shows the results.
+        nowPlaying(ytMusic, 2500, notTitle = before)?.let { endAfterReply = true; musicStarted = true; return "Now playing $it." }
+        val screen = screen() ?: return "ERROR: YouTube Music is showing results for \"$query\" but didn't start playing, " +
+            "and accessibility is off so I can't press play. The user can tap a song."
+        if (!screen.playFirstResult(ytMusic)) return "ERROR: YouTube Music showed no songs for \"$query\"."
+        return (nowPlaying(ytMusic, 5000, notTitle = before) ?: nowPlaying(ytMusic, 0))
+            ?.let { endAfterReply = true; musicStarted = true; "Now playing $it." }
+            ?: "ERROR: tapped the first song for \"$query\" but nothing is playing. Say so honestly."
+    }
+
+    /**
+     * "Un Vizhigalil by Anirudh Ravichander" when something (in [pkg], if given) is really playing within [waitMs],
+     * else null. Read from Android's media sessions, which needs the notification access the app already has.
+     */
+    /**
+     * After she has spoken over newly started music, the music app may have paused for her voice and not carried
+     * on: press Play if nothing is playing now.
+     */
+    suspend fun resumeMusicIfPaused() {
+        if (nowPlaying(null, 1500) != null) { PicoLog.i("Music still playing"); return }
+        context.getSystemService(AudioManager::class.java).apply {
+            dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_DOWN, KeyEvent.KEYCODE_MEDIA_PLAY))
+            dispatchMediaKeyEvent(KeyEvent(KeyEvent.ACTION_UP, KeyEvent.KEYCODE_MEDIA_PLAY))
+        }
+        PicoLog.i("Music had paused; pressed play -> " + (nowPlaying(null, 3000) ?: "still not playing"))
+    }
+
+    /** The title of the song a music app has loaded, playing or not. */
+    private fun currentTitle(pkg: String): String? = runCatching {
+        context.getSystemService(android.media.session.MediaSessionManager::class.java)
+            .getActiveSessions(android.content.ComponentName(context, NotificationReader::class.java))
+            .firstOrNull { it.packageName == pkg }?.metadata?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE)
+    }.getOrNull()
+
+    private suspend fun nowPlaying(pkg: String?, waitMs: Long, notTitle: String? = null): String? {
+        val msm = context.getSystemService(android.media.session.MediaSessionManager::class.java)
+        val until = System.currentTimeMillis() + waitMs
+        while (true) {
+            val sessions = runCatching {
+                msm.getActiveSessions(android.content.ComponentName(context, NotificationReader::class.java))
+            }.getOrNull()
+            val playing = sessions?.firstOrNull {
+                (pkg == null || it.packageName == pkg) && it.playbackState?.state == android.media.session.PlaybackState.STATE_PLAYING
+            }
+            if (playing != null) {
+                val m = playing.metadata
+                val title = m?.getString(android.media.MediaMetadata.METADATA_KEY_TITLE)
+                val artist = m?.getString(android.media.MediaMetadata.METADATA_KEY_ARTIST)
+                val now = listOfNotNull(title?.takeIf { it.isNotBlank() }, artist?.takeIf { it.isNotBlank() }?.let { "by $it" })
+                    .joinToString(" ").ifEmpty { "music" }
+                // Still the song from before (the new one hasn't started yet): keep waiting.
+                if (notTitle == null || title.isNullOrBlank() || title != notTitle) return now
+            }
+            if (sessions == null && context.getSystemService(AudioManager::class.java).isMusicActive) return "music"
+            if (System.currentTimeMillis() >= until) return null
+            kotlinx.coroutines.delay(300)
+        }
+    }
+
+    /** The Clock app that answers "show alarms" (OnePlus, Google, Samsung…). */
+    private fun clockPackage(): String? = context.packageManager
+        .resolveActivity(Intent(AlarmClock.ACTION_SHOW_ALARMS), 0)?.activityInfo?.packageName
+
+    private fun openAlarms() = start(Intent(AlarmClock.ACTION_SHOW_ALARMS))
+
+    /** The next alarm the phone will ring, straight from Android (no screen reading needed). */
+    private fun nextAlarm(): String? {
+        val next = context.getSystemService(android.app.AlarmManager::class.java)?.nextAlarmClock ?: return null
+        return SimpleDateFormat("EEEE h:mm a", Locale.ENGLISH).format(Date(next.triggerTime))
+    }
+
+    private suspend fun listAlarms(): String {
+        val next = nextAlarm()?.let { "The next alarm to ring: $it. " }.orEmpty()
+        val screen = screen() ?: return next + "To list every alarm, accessibility must be on for the app."
+        val pkg = clockPackage() ?: return next + "ERROR: no Clock app found."
+        val rows = try { screen.alarms(pkg) { openAlarms() } } finally { screen.leave() }
+            ?: return next + "ERROR: the Clock app didn't open."
+        if (rows.isEmpty()) return next + "There are no alarms in the Clock app."
+        // Counted here, so the reply never has to count (it once said "five are on… wait").
+        val on = rows.filter { it.on == true }
+        val off = rows.filter { it.on != true }
+        return next + "${rows.size} alarms in the Clock app. ${on.size} on: " +
+            on.joinToString("; ") { "${it.time} (${it.days})" }.ifEmpty { "none" } +
+            ". ${off.size} off: " + off.joinToString("; ") { "${it.time} (${it.days})" }.ifEmpty { "none" } + "."
+    }
+
+    private suspend fun switchAlarm(hour: Int, minute: Int, on: Boolean, todayOnly: Boolean): String {
+        if (hour !in 0..23 || minute !in 0..59) return "ERROR: that time isn't valid"
+        val screen = screen() ?: return ACCESSIBILITY_OFF
+        val pkg = clockPackage() ?: return "ERROR: no Clock app found."
+        val nextBefore = nextAlarmAt()
+        val result = try { screen.switchAlarm(pkg, hour, minute, on, todayOnly) { openAlarms() } } finally { screen.leave() }
+        if (!result.startsWith("SKIPPED_TODAY:")) return result
+        // Skipping one ring leaves the switch on, so check with Android that the next ring really moved.
+        kotlinx.coroutines.delay(600)
+        val nextAfter = nextAlarmAt()
+        val said = result.removePrefix("SKIPPED_TODAY: ")
+        return if (nextAfter != nextBefore) "Done: $said The next alarm to ring is now ${nextAlarm() ?: "none"}."
+        else "ERROR: $said but Android still has the same next alarm (${nextAlarm()}), so it may not have worked."
+    }
+
+    private fun nextAlarmAt(): Long? = context.getSystemService(android.app.AlarmManager::class.java)?.nextAlarmClock?.triggerTime
 
     private fun setAlarm(hour: Int, minute: Int, label: String): String {
         if (hour !in 0..23 || minute !in 0..59) return "ERROR: that time isn't valid"
@@ -394,6 +552,107 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
                 "Do Not Disturb on. Starred contacts and alarms still come through."
             }
         }
+    }
+
+    // ---------- Settings screens ----------
+
+    /** Opens a Settings screen directly, instead of tapping through the Settings app to find it. */
+    private fun openSettings(page: String, app: String): String {
+        val intent = when (page) {
+            "wifi" -> Intent(Settings.ACTION_WIFI_SETTINGS)
+            "bluetooth" -> Intent(Settings.ACTION_BLUETOOTH_SETTINGS)
+            "hotspot" -> Intent().setClassName("com.android.settings", "com.android.settings.TetherSettings")
+            "mobile_network" -> Intent(Settings.ACTION_NETWORK_OPERATOR_SETTINGS)
+            "data_usage" -> Intent(Settings.ACTION_DATA_USAGE_SETTINGS)
+            "airplane_mode" -> Intent(Settings.ACTION_AIRPLANE_MODE_SETTINGS)
+            "battery" -> Intent(Intent.ACTION_POWER_USAGE_SUMMARY)
+            "battery_saver" -> Intent(Settings.ACTION_BATTERY_SAVER_SETTINGS)
+            "display" -> Intent(Settings.ACTION_DISPLAY_SETTINGS)
+            "sound" -> Intent(Settings.ACTION_SOUND_SETTINGS)
+            "notifications" -> Intent(Settings.ACTION_APP_NOTIFICATION_SETTINGS).putExtra(Settings.EXTRA_APP_PACKAGE, context.packageName)
+            "location" -> Intent(Settings.ACTION_LOCATION_SOURCE_SETTINGS)
+            "storage" -> Intent(Settings.ACTION_INTERNAL_STORAGE_SETTINGS)
+            "apps" -> Intent(Settings.ACTION_APPLICATION_SETTINGS)
+            "app_info" -> {
+                val pkg = findPackage(app) ?: return "ERROR: no app called '$app' is installed"
+                Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$pkg"))
+            }
+            "security" -> Intent(Settings.ACTION_SECURITY_SETTINGS)
+            "date_time" -> Intent(Settings.ACTION_DATE_SETTINGS)
+            "language" -> Intent(Settings.ACTION_LOCALE_SETTINGS)
+            "accessibility" -> Intent(Settings.ACTION_ACCESSIBILITY_SETTINGS)
+            "nfc" -> Intent(Settings.ACTION_NFC_SETTINGS)
+            "vpn" -> Intent(Settings.ACTION_VPN_SETTINGS)
+            "developer" -> Intent(Settings.ACTION_APPLICATION_DEVELOPMENT_SETTINGS)
+            "about_phone" -> Intent(Settings.ACTION_DEVICE_INFO_SETTINGS)
+            else -> Intent(Settings.ACTION_SETTINGS)
+        }
+        return try {
+            start(intent)
+            "Opened ${page.replace('_', ' ')} settings."
+        } catch (e: ActivityNotFoundException) {
+            // Some phones (OnePlus, Xiaomi) hide or rename a screen; the network page is the closest for hotspot.
+            start(Intent(if (page == "hotspot") Settings.ACTION_WIRELESS_SETTINGS else Settings.ACTION_SETTINGS))
+            "This phone has no direct ${page.replace('_', ' ')} page, so I opened the closest Settings screen."
+        }
+    }
+
+    /** The package of an installed app, matched by its name the way open_app does. */
+    private fun findPackage(appName: String): String? {
+        if (appName.isBlank()) return null
+        val pm = context.packageManager
+        val q = appName.lowercase()
+        val launcher = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+        return pm.queryIntentActivities(launcher, 0)
+            .map { it.activityInfo.packageName to it.loadLabel(pm).toString().lowercase() }
+            .maxByOrNull { (_, l) -> if (l == q) 3 else if (l.startsWith(q)) 2 else if (l.contains(q)) 1 else 0 }
+            ?.takeIf { (_, l) -> l.contains(q) }?.first
+    }
+
+    // ---------- Email ----------
+
+    /**
+     * Opens a ready-to-send email in the phone's email app (Gmail…), with the address, subject and text filled in.
+     * The user reviews it and taps Send, so a draft can't go out wrong by itself.
+     */
+    private fun draftEmail(to: String, subject: String, body: String): String {
+        if (subject.isBlank() && body.isBlank()) return "ERROR: what should the email say?"
+        val address = when {
+            to.isBlank() -> ""
+            '@' in to -> to.trim()
+            else -> findEmail(to) ?: return "ERROR: no email address saved for '$to'. Ask the user for the address."
+        }
+        // Subject and text go in both the link and the extras: different email apps read different ones.
+        val uri = Uri.parse("mailto:${Uri.encode(address)}?subject=${Uri.encode(subject)}&body=${Uri.encode(body)}")
+        val intent = Intent(Intent.ACTION_SENDTO, uri)
+            .putExtra(Intent.EXTRA_SUBJECT, subject)
+            .putExtra(Intent.EXTRA_TEXT, body)
+        return try {
+            start(intent)
+            val who = if (address.isEmpty()) "with no address yet (the user can add one)" else "to $address"
+            "Opened an email draft $who. The user checks it and taps Send."
+        } catch (e: ActivityNotFoundException) {
+            "ERROR: there's no email app on this phone"
+        }
+    }
+
+    private fun findEmail(name: String): String? {
+        if (!granted(Manifest.permission.READ_CONTACTS)) return null
+        val q = name.trim().lowercase()
+        context.contentResolver.query(
+            Email.CONTENT_URI, arrayOf(Email.DISPLAY_NAME, Email.ADDRESS), null, null, null
+        )?.use { c ->
+            var best: String? = null
+            var bestScore = 0
+            while (c.moveToNext()) {
+                val n = c.getString(0)?.lowercase() ?: continue
+                val address = c.getString(1) ?: continue
+                val score = when { n == q -> 3; n.startsWith(q) -> 2; n.contains(q) -> 1; else -> 0 }
+                if (score > bestScore) { bestScore = score; best = address }
+            }
+            return best
+        }
+        return null
     }
 
     // ---------- Maps ----------
@@ -600,7 +859,7 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
         if (at <= now) return "ERROR: that time has already passed"
         val r = Reminders.add(context, prefs, at, text)
         val spoken = if (MissMinutesService.running) "I'll say it out loud and post a notification."
-                     else "Miss Minutes is switched off, so it will only appear as a notification."
+                     else "${prefs.assistantName} is switched off, so it will only appear as a notification."
         return "Reminder set for ${Reminders.describe(r.at)}: ${r.text}. $spoken"
     }
 
@@ -632,7 +891,7 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
             once = input.optBoolean("once", false),
         )
         Watches.add(prefs, w)
-        val spoken = if (MissMinutesService.running) "" else " Miss Minutes is switched off, so she can't speak them until it's started."
+        val spoken = if (MissMinutesService.running) "" else " ${prefs.assistantName} is switched off, so the alerts can't be spoken until it's started."
         return "Now watching for ${w.describe()}.$spoken"
     }
 
@@ -643,14 +902,59 @@ class PhoneActions(private val context: Context, private val prefs: Prefs) {
 
     companion object {
         private const val ACCESSIBILITY_OFF =
-            "ERROR: Accessibility is off for Miss Minutes. The user can turn it on in the Miss Minutes app."
+            "ERROR: Accessibility is off for the assistant. The user can turn it on in the app."
         private const val DND_OFF =
-            "ERROR: Miss Minutes isn't allowed to change Do Not Disturb or silent mode yet. The user can turn on Do Not Disturb access in the Miss Minutes app."
+            "ERROR: The assistant isn't allowed to change Do Not Disturb or silent mode yet. The user can turn on Do Not Disturb access in the app."
         private const val CALENDAR_OFF =
-            "ERROR: Calendar permission is off. The user can allow it in the Miss Minutes app."
+            "ERROR: Calendar permission is off. The user can allow it in the app."
         private const val BRIGHTNESS_OFF =
-            "ERROR: Miss Minutes isn't allowed to change brightness yet. The user can turn on Change brightness in the Miss Minutes app."
+            "ERROR: The assistant isn't allowed to change brightness yet. The user can turn on Change brightness in the app."
         private const val NOTIFICATIONS_OFF =
-            "ERROR: Notification access is off for Miss Minutes. The user can allow it in the Miss Minutes app."
+            "ERROR: Notification access is off for the assistant. The user can allow it in the app."
+    }
+
+    /** Not-available mode on: until a clock time, for some minutes, or until they say they're back. */
+    private fun setAway(input: JSONObject): String {
+        val now = System.currentTimeMillis()
+        val until = when {
+            input.has("hour") -> java.util.Calendar.getInstance().apply {
+                set(java.util.Calendar.HOUR_OF_DAY, input.optInt("hour")); set(java.util.Calendar.MINUTE, input.optInt("minute", 0))
+                set(java.util.Calendar.SECOND, 0); set(java.util.Calendar.MILLISECOND, 0)
+                if (timeInMillis <= now) add(java.util.Calendar.DAY_OF_YEAR, 1)
+            }.timeInMillis
+            input.optInt("minutes", 0) > 0 -> now + input.optInt("minutes") * 60_000L
+            else -> 0L
+        }
+        Away.start(context, prefs, input.text("reason").ifEmpty { "busy" }, until)
+        val screening = Build.VERSION.SDK_INT >= 29 && context.getSystemService(android.app.role.RoleManager::class.java)
+            ?.isRoleHeld(android.app.role.RoleManager.ROLE_CALL_SCREENING) == true
+        return "Not-available mode is on" + (if (until > 0) " until ${Away.clock(until)}" else " until the user says they're back") + ". " +
+            (if (screening) "Calls are declined with a text back, except starred contacts and anyone calling twice in 5 minutes. "
+            else "Call handling is off: the user needs to allow call screening in the app (Home, Not available card). ") +
+            (if (prefs.awayReplyChats) "Chat messages get one polite reply each." else "")
+    }
+
+    /** Everything for a morning briefing: weather, today's calendar and reminders, and what came in overnight. */
+    private suspend fun briefing(): String {
+        val today = java.util.Calendar.getInstance()
+        prefs.lastBriefingDay = today.get(java.util.Calendar.YEAR) * 1000 + today.get(java.util.Calendar.DAY_OF_YEAR)
+        val weather = runCatching { Weather.get(context, prefs, "", 1) }.getOrDefault("ERROR: weather unavailable")
+        val calendar = runCatching { readCalendar("", 1) }.getOrDefault("Calendar unavailable.")
+        val endOfDay = (today.clone() as java.util.Calendar).apply {
+            set(java.util.Calendar.HOUR_OF_DAY, 23); set(java.util.Calendar.MINUTE, 59)
+        }.timeInMillis
+        val reminders = Reminders.all(prefs).filter { it.at <= endOfDay }
+            .joinToString("; ") { "${it.text} at ${Reminders.describe(it.at)}" }.ifEmpty { "None." }
+        return "WEATHER: $weather\nCALENDAR TODAY: $calendar\nREMINDERS TODAY: $reminders\n" +
+            "OVERNIGHT: ${NotificationReader.describeUnread(NotificationReader.unread())}"
+    }
+
+    /** "Where can I buy this?": Google's results for the product, in the browser (the camera window steps aside). */
+    private fun shopOnGoogle(query: String): String {
+        if (query.isBlank()) return "ERROR: what should I search for?"
+        if (PicoCamera.open) context.startActivity(Intent(context, CameraActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK).putExtra("close", true))
+        start(Intent(Intent.ACTION_VIEW, Uri.parse("https://www.google.com/search?tbm=shop&q=${Uri.encode(query)}")))
+        return "Opened Google results for \"$query\"."
     }
 }

@@ -38,20 +38,17 @@ class Prefs(context: Context) {
     var sarvamSpeaker: String
         get() = str("sarvam_speaker", Voices.default).takeIf { it in Voices.sarvam } ?: Voices.default
         set(v) = putStr("sarvam_speaker", v)
-    /** Who speaks for her: [SARVAM] or [ELEVENLABS]. She always hears you with Sarvam. */
-    var voiceProvider: String
-        get() = str("voice_provider", SARVAM).takeIf { it == ELEVENLABS } ?: SARVAM
-        set(v) = putStr("voice_provider", v)
-    var elevenKey: String get() = secret("eleven_key"); set(v) = putSecret("eleven_key", v)
-    var elevenVoice: String
-        get() = str("eleven_voice", ElevenVoices.default.id).takeIf { id -> ElevenVoices.all.any { it.id == id } }
-            ?: ElevenVoices.default.id
-        set(v) = putStr("eleven_voice", v)
-    var elevenModel: String
-        get() = str("eleven_model", ElevenModel.TURBO.id).takeIf { ElevenModel.byId(it) != null } ?: ElevenModel.TURBO.id
-        set(v) = putStr("eleven_model", v)
-    /** Live mode: real-time ElevenLabs conversations instead of listen, then think, then speak. */
-    var liveMode: Boolean get() = bool("live_mode", false); set(v) = putBool("live_mode", v)
+    /**
+     * Pico Live: hears you while you talk (Sarvam streaming), answers after a shorter pause, and keeps the
+     * conversation going without the wake word. Off is the classic listen, then think, then speak.
+     */
+    var picoLive: Boolean get() = bool("pico_live", true); set(v) = putBool("pico_live", v)
+    /** Pico's colour (a [GhostTheme] name). */
+    var ghostTheme: String get() = str("ghost_theme", GhostTheme.MINT.name); set(v) = putStr("ghost_theme", v)
+    /** Short sound cues (wake, heard, success, error, alerts). Always silent on silent or vibrate. */
+    var sounds: Boolean get() = bool("sounds", true); set(v) = putBool("sounds", v)
+    /** Little feeling sounds ("awww", a giggle, "hmph") with the mood of a reply. */
+    var moodSounds: Boolean get() = bool("mood_sounds", true); set(v) = putBool("mood_sounds", v)
     var countryCode: String get() = str("country_code", "91"); set(v) = putStr("country_code", v)
 
     var confirmBeforeSending: Boolean get() = bool("confirm", true); set(v) = putBool("confirm", v)
@@ -60,17 +57,32 @@ class Prefs(context: Context) {
     var bargeIn: Boolean get() = bool("barge_in", true); set(v) = putBool("barge_in", v)
     var edgeGlow: Boolean get() = bool("edge_glow", true); set(v) = putBool("edge_glow", v)
 
-    /** What wakes her, in English letters ("hey miss minutes"). Editable in the app; no training needed. */
+    /** The assistant's name ("Pico" unless the user renamed them). The app itself is always called Pico. */
+    var assistantName: String
+        get() = str("assistant_name", Assistant.DEFAULT_NAME).ifBlank { Assistant.DEFAULT_NAME }
+        set(v) = putStr("assistant_name", v)
+    /** A [Presentation] name: decides the wording (she / he / they) and which voices are suggested. */
+    var presentation: String get() = str("presentation", Presentation.FEMININE.name); set(v) = putStr("presentation", v)
+    /** The user's city, for local answers ("weather here"). Optional. */
+    var city: String get() = str("city", ""); set(v) = putStr("city", v)
+    /** Use the user's name in some wake-up greetings ("Hey Gokul!"). */
+    var greetWithName: Boolean get() = bool("greet_with_name", true); set(v) = putBool("greet_with_name", v)
+    /** The agents the user created, as a JSON array (see Agents.kt). */
+    var agentsJson: String get() = str("agents", "[]"); set(v) = putStr("agents", v)
+    /** When the last backup file was saved (epoch ms), or 0. */
+    var lastBackupAt: Long get() = sp.getLong("last_backup_at", 0L); set(v) = sp.edit().putLong("last_backup_at", v).apply()
+
+    /** What wakes the assistant, in English letters ("hey pico"). Editable in the app; no training needed. */
     var wakePhrase: String
         get() = WakeWord.normalize(str("wake_phrase", WakeWord.DEFAULT_PHRASE)).ifEmpty { WakeWord.DEFAULT_PHRASE }
         set(v) = putStr("wake_phrase", WakeWord.normalize(v))
-    /** What she calls the user. Empty means she doesn't use a name. */
+    /** What the assistant calls the user. Empty means no name is used. */
     var userName: String get() = str("user_name", ""); set(v) = putStr("user_name", v)
     /** Say a short hello ("சொல்லுங்க Arun!") when woken, before listening. */
     var greetOnWake: Boolean get() = bool("greet_on_wake", true); set(v) = putBool("greet_on_wake", v)
     /** The day (yyyyDDD) of the last greeting, so the first one each morning can say good morning. */
     var lastGreetDay: Int get() = sp.getInt("last_greet_day", 0); set(v) = sp.edit().putInt("last_greet_day", v).apply()
-    /** The welcome screen has been seen. */
+    /** Setup (onboarding) is done; returning users never see it again unless they ask to. */
     var welcomed: Boolean get() = bool("welcomed", false); set(v) = putBool("welcomed", v)
 
     var wakeSensitivity: Float
@@ -83,31 +95,69 @@ class Prefs(context: Context) {
             val a = JSONArray(str("memories", "[]"))
             List(a.length()) { a.getString(it) }
         }.getOrDefault(emptyList())
-        set(v) = putStr("memories", JSONArray(v.takeLast(60)).toString())
+        set(v) = putStr("memories", JSONArray(v.takeLast(MAX_MEMORIES)).toString())
 
     /** Routines: one phrase ("good night") runs several steps, written in plain words for Claude to carry out. */
     var routines: Map<String, String>
         get() = runCatching {
-            val o = JSONObject(str("routines", DEFAULT_ROUTINES))
+            val o = JSONObject(str("routines", "{}")) // new installs start with no routines at all
             o.keys().asSequence().associateWith { o.getString(it) }
         }.getOrDefault(emptyMap())
         set(v) = putStr("routines", JSONObject(v).toString())
+
+    /** The last few conversations (see [Recent]), newest last, for the Home screen. */
+    var recentJson: String get() = str("recent", "[]"); set(v) = putStr("recent", v)
+    /** Memory imports so far: when, from what, and how many were added. */
+    var importsJson: String get() = str("imports", "[]"); set(v) = putStr("imports", v)
+    /** Not-available mode (see [Away]): its state, what happened, and who already got the auto-reply. */
+    var awayJson: String get() = str("away", ""); set(v) = putStr("away", v)
+    var awayLogJson: String get() = str("away_log", "[]"); set(v) = putStr("away_log", v)
+    var awayRepliedJson: String get() = str("away_replied", "[]"); set(v) = putStr("away_replied", v)
+    var awayTextCallers: Boolean get() = bool("away_text_callers", true); set(v) = putBool("away_text_callers", v)
+    var awayReplyChats: Boolean get() = bool("away_reply_chats", true); set(v) = putBool("away_reply_chats", v)
+    var awayLetStarred: Boolean get() = bool("away_let_starred", true); set(v) = putBool("away_let_starred", v)
+    /** Auto-replies only go to saved contacts (no texts to spam callers, offers or bank alerts). */
+    var awayContactsOnly: Boolean get() = bool("away_contacts_only", true); set(v) = putBool("away_contacts_only", v)
+    var awayLetRepeat: Boolean get() = bool("away_let_repeat", true); set(v) = putBool("away_let_repeat", v)
+    /** The user's own auto-reply ({until} becomes the time), or empty for the standard one. */
+    var awayMessage: String get() = str("away_message", ""); set(v) = putStr("away_message", v)
+    /** The day (year*1000 + day of year) the morning briefing was last given. */
+    var lastBriefingDay: Int get() = sp.getInt("last_briefing_day", 0); set(v) = sp.edit().putInt("last_briefing_day", v).apply()
+    /** "Chat for me": whose chat the assistant is keeping going, and the last lines of it. */
+    var chatJson: String get() = str("chat", ""); set(v) = putStr("chat", v)
+    var chatLogJson: String get() = str("chat_log", "[]"); set(v) = putStr("chat_log", v)
+    /** How many times the camera button's tip has been shown (it's shown twice, then never again). */
+    var cameraHintShown: Int get() = sp.getInt("camera_hint", 0); set(v) = sp.edit().putInt("camera_hint", v).apply()
+    /** Where the phone was last seen, city level (see [Place]). */
+    var lastPlaceJson: String get() = str("last_place", ""); set(v) = putStr("last_place", v)
+    /** The user wants the assistant listening (they tapped Start and haven't tapped Stop). */
+    var wantRunning: Boolean get() = bool("want_running", false); set(v) = putBool("want_running", v)
+    /** The setup step to come back to if the app closed half-way through. */
+    var setupStep: Int get() = sp.getInt("setup_step", 0); set(v) = sp.edit().putInt("setup_step", v).apply()
 
     /** Pending reminders and notification watches, as JSON arrays (see Reminders.kt). */
     var remindersJson: String get() = str("reminders", "[]"); set(v) = putStr("reminders", v)
     var watchesJson: String get() = str("watches", "[]"); set(v) = putStr("watches", v)
 
     companion object {
-        const val SARVAM = "sarvam"
-        const val ELEVENLABS = "elevenlabs"
+        /** Kept small enough to send with every request; imports stop at this many. */
+        const val MAX_MEMORIES = 150
 
-        /** Ready-made routines; the user can change or delete them by voice or in the app. */
+        /** Ready-made routines, kept only for installs from before they were removed for new users. */
         private val DEFAULT_ROUTINES: String = JSONObject(mapOf(
             "good night" to "Turn on Do Not Disturb until 6 AM, set brightness to 10 percent, set media volume to 20 percent, " +
                 "mention tomorrow's first calendar event if there is one, and wish me good night.",
             "good morning" to "Turn Do Not Disturb off, turn auto brightness on, then tell me today's weather and today's " +
                 "calendar events in two or three short sentences.",
             "i'm driving" to "Set media volume to 80 percent and ask me where I'm going, then start navigation there.",
+            "i'm home" to "Turn Wi-Fi on, put the ringer back on, turn Do Not Disturb off, and tell me any reminders " +
+                "left for today.",
+            "going out" to "Tell me the battery level, the weather right now and my next calendar event, in two short sentences.",
+            "focus mode" to "Turn on Do Not Disturb for 60 minutes and say you'll keep things quiet for an hour.",
+            "meeting mode" to "Put the phone on silent and set a reminder in 60 minutes to turn the ringer back on.",
+            "workout time" to "Set media volume to 80 percent and play a workout music playlist on YouTube.",
+            "movie time" to "Turn on Do Not Disturb, set brightness to 40 percent and media volume to 70 percent.",
+            "lunch break" to "Start a 30 minute timer called lunch and tell me if I have a calendar event in the next hour.",
         )).toString()
     }
 
@@ -121,6 +171,18 @@ class Prefs(context: Context) {
         if (sp.contains("claude_model")) sp.edit().remove("claude_model").apply()
         // The Picovoice wake word was replaced by Vosk, which needs no key.
         sp.edit().remove("pico_key").remove("pico_key_enc").apply()
+        // Existing installs keep the ready-made routines (their own and their changes win); new installs start
+        // empty, with no sample data of any kind.
+        if (!bool("routines_v2", false)) {
+            if (welcomed) {
+                val defaults = JSONObject(DEFAULT_ROUTINES)
+                routines = defaults.keys().asSequence().associateWith { defaults.getString(it) } + routines
+            }
+            putBool("routines_v2", true)
+        }
+        // ElevenLabs was removed (too costly per minute): forget its key and settings.
+        sp.edit().remove("eleven_key_enc").remove("eleven_voice").remove("eleven_model")
+            .remove("voice_provider").remove("live_mode").apply()
     }
 }
 

@@ -19,12 +19,19 @@ class VoiceRecorder {
         const val SAMPLE_RATE = 16000
         private const val CHUNK = 800              // 50 ms
         private const val CALIBRATION_CHUNKS = 6   // first 300 ms measures room noise
-        private const val END_SILENCE_MS = 850L
+        const val END_SILENCE_MS = 850L
         private const val MIN_SPEECH_CHUNKS = 5    // 250 ms of voice; a click or a cough isn't a request
+        /**
+         * Less than a full request, but more than a click: 150 ms of voice in all. Speech-to-text decides if it was
+         * words. Quick or soft requests ("time?") used to be thrown away here and you had to wake her again.
+         */
+        private const val MAYBE_SPEECH_CHUNKS = 3
         private const val MAX_MS = 15000L
         private const val NOISE_MARGIN = 2.5      // your voice must be this many times louder than the room
 
-        private fun thresholdFor(noise: Double) = (noise * NOISE_MARGIN).coerceIn(800.0, 3500.0)
+        // The floor was 800: in a quiet room (noise ~100) that, not the room, set the bar, and a soft voice
+        // at 600-700 never counted. Clicks and coughs are still stopped by the 250 ms rule.
+        private fun thresholdFor(noise: Double) = (noise * NOISE_MARGIN).coerceIn(550.0, 3500.0)
     }
 
     @Volatile private var cancelled = false
@@ -36,11 +43,15 @@ class VoiceRecorder {
     /**
      * Blocking. Returns WAV bytes, or null if nothing was said within [waitForSpeechMs].
      * [alreadySaid] is PCM you started saying before recording began (when you cut in while she was talking).
+     * [endSilenceMs] of quiet after speech means you're done. [onAudio] gets the 16-bit PCM as it's recorded
+     * (for live hearing); the buffer is reused, so use it before returning.
      */
     @SuppressLint("MissingPermission")
     fun record(
         waitForSpeechMs: Long = 6000L,
         alreadySaid: ByteArray? = null,
+        endSilenceMs: Long = END_SILENCE_MS,
+        onAudio: ((ByteArray, Int) -> Unit)? = null,
         onLevel: (Float) -> Unit = {},
     ): ByteArray? {
         cancelled = false
@@ -66,15 +77,17 @@ class VoiceRecorder {
         val bytes = ByteBuffer.allocate(CHUNK * 2).order(ByteOrder.LITTLE_ENDIAN)
         var noise = 0.0
         var noiseChunks = 0
-        var threshold = 900.0
+        var threshold = 700.0
         var speechStarted = false
         var speechChunks = 0
+        var voicedTotal = 0 // every chunk over the bar, never reset
         var peak = 0.0
         val start = System.currentTimeMillis()
         var lastSpeech = start
         if (alreadySaid != null) {
             // You're mid-sentence: skip measuring room noise, which would mistake your voice for it.
             pcm.write(alreadySaid)
+            onAudio?.invoke(alreadySaid, alreadySaid.size)
             speechStarted = true
             speechChunks = MIN_SPEECH_CHUNKS
             noiseChunks = CALIBRATION_CHUNKS
@@ -89,6 +102,7 @@ class VoiceRecorder {
                 bytes.clear()
                 for (i in 0 until n) bytes.putShort(buf[i])
                 pcm.write(bytes.array(), 0, n * 2)
+                onAudio?.invoke(bytes.array(), n * 2)
 
                 var sum = 0.0
                 for (i in 0 until n) sum += buf[i].toDouble() * buf[i]
@@ -106,7 +120,7 @@ class VoiceRecorder {
                     continue
                 }
                 if (rms > threshold) {
-                    speechStarted = true; speechChunks++; lastSpeech = now
+                    speechStarted = true; speechChunks++; voicedTotal++; lastSpeech = now
                 } else if (!speechStarted && rms < noise * 1.5) {
                     // Follow the room (a fan speeding up, traffic dying down), but only sounds close to its level:
                     // your quieter first words must never count as noise, or the bar climbs past your voice.
@@ -117,7 +131,7 @@ class VoiceRecorder {
 
                 val elapsed = now - start
                 if (!speechStarted && elapsed > waitForSpeechMs) break
-                if (speechStarted && now - lastSpeech > END_SILENCE_MS) {
+                if (speechStarted && now - lastSpeech > endSilenceMs) {
                     if (speechChunks >= MIN_SPEECH_CHUNKS) break
                     // Only a short bump of noise: keep waiting for real words.
                     speechStarted = false
@@ -130,10 +144,11 @@ class VoiceRecorder {
             runCatching { recorder.stop() }
             recorder.release()
             ns?.release()
-            Log.i("MissMinutes", "Recording: noise=${noise.toInt()} threshold=${threshold.toInt()} " +
-                "peak=${peak.toInt()} speech=${speechChunks * 50}ms heard=$speechStarted")
+            PicoLog.i("Recording: noise=${noise.toInt()} threshold=${threshold.toInt()} " +
+                "peak=${peak.toInt()} speech=${speechChunks * 50}ms voiced=${voicedTotal * 50}ms heard=$speechStarted")
         }
-        if (!speechStarted || cancelled) return null
+        if (cancelled) return null
+        if (!speechStarted && voicedTotal < MAYBE_SPEECH_CHUNKS) return null
         return toWav(pcm.toByteArray())
     }
 

@@ -1,4 +1,6 @@
 <?xml version="1.0" encoding="utf-8"?>
 <resources>
     <color name="ink">#FF17111C</color>
+    <!-- App icon background: the night blue behind Pico. -->
+    <color name="icon_bg">#FF151A33</color>
 </resources>

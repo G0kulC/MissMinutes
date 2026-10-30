@@ -1,5 +1,5 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Debug builds only: lets a developer send Miss Minutes a request over adb, see DebugAskReceiver. -->
+<!-- Debug builds only: lets a developer send Pico a request over adb, see DebugAskReceiver. -->
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
     <application>
         <receiver
